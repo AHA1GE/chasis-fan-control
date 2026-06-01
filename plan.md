@@ -4,11 +4,12 @@
 
 The hardware (`hardware/pins.md`, `hardware/Netlist_fan-control.asc`) defines a dual-fan controller with:
 - CH32V003F4P6 MCU (48 MHz RISC-V, 16 KB flash, 2 KB SRAM)
-- 2× PWM outputs (PD5 = Fan1, PD6 = Fan2) at 25 kHz
-- 2× tachometer inputs (PC7 = Fan1, PD3 = Fan2) via interrupt pulse counting
-- 4× WS2812C LEDs daisy-chained on PC2 (battery gauge + speed indicator)
-- 1× button on PC1 (active-low, internal pull-up) for speed selection
-- ADC on PD2 for battery voltage (10k/4.7k divider), auto-detect 1S/2S/3S
+- 2× PWM outputs (PD5 = Fan1, PD6 = Fan2) at 25 kHz via TIM1 (PartialRemap1)
+- 2× tachometer inputs (PD2 = Fan1, PA1 = Fan2) via interrupt pulse counting
+- 4× WS2812C LEDs daisy-chained on **PC6 / SPI1_MOSI** — driven via hardware SPI at 3 MHz
+- 1× button on PC3 (active-low, internal pull-up) for speed selection
+- ADC on PA2 for battery voltage (10k/4.7k divider), auto-detect 1S/2S/3S
+- NRST on PD7; SWD/SWIO on PD1
 - Physical on/off via MOSFET + slide switch (no firmware involvement)
 
 ## Code Style & Philosophy
@@ -22,7 +23,7 @@ Follow the patterns in `referenceFirmware/ADC2PWM.ino`:
 - **Non-blocking `loop()`** — use `millis()` interval checks instead of `delay()` so the button stays responsive
 - **Optional debug toggles** — `#if ENABLE_SCREEN` pattern can be adapted for serial/screen debug if needed
 
-The only module that requires low-level register access is the **WS2812 bit-bang** (cycle-accurate timing), and it is isolated to a single function wrapped in `noInterrupts()`/`interrupts()`. The **PWM timer** may need a small register-level init block (like the `Servo` library does internally), also encapsulated once in `setup()`.
+The only modules that require low-level register access are **fan PWM init** and **SPI init** (both encapsulated once in `setup()`, like the `Servo` library pattern). The WS2812 data path uses pure SPI byte transfers — no inline assembly, no cycle counting, and most importantly **no interrupt disabling**.
 
 ---
 
@@ -31,9 +32,9 @@ The only module that requires low-level register access is the **WS2812 bit-bang
 ### 1. Pin Definitions & Constants
 
 ```cpp
-// ---- Fan PWM ----
-#define PWM_FAN1_PIN      PD5   // TIM1_CH1 after PartialRemap1
-#define PWM_FAN2_PIN      PD6   // TIM1_CH2 after PartialRemap1
+// ---- Fan PWM (TIM1 with PartialRemap1: CH1→PD5, CH2→PD6) ----
+#define PWM_FAN1_PIN      PD5   // TIM1_CH1, Fan 1
+#define PWM_FAN2_PIN      PD6   // TIM1_CH2, Fan 2
 #define PWM_FREQ_HZ       25000
 #define PWM_PERIOD        1919  // 48MHz / 25000 - 1
 #define DUTY_0_PERCENT    0
@@ -43,16 +44,17 @@ The only module that requires low-level register access is the **WS2812 bit-bang
 #define DUTY_100_PERCENT  1919
 
 // ---- Tachometer ----
-#define TACH1_PIN         PC7
-#define TACH2_PIN         PD3
-#define TACH_WINDOW_MS    2000   // RPM measurement interval
+#define TACH1_PIN         PD2   // Fan 1 tach
+#define TACH2_PIN         PA1   // Fan 2 tach
+#define TACH_WINDOW_MS    2000  // RPM measurement interval
 
-// ---- WS2812 ----
-#define RGB_PIN           PC2
+// ---- WS2812 via SPI ----
+#define RGB_PIN           PC6   // SPI1_MOSI
 #define NUM_LEDS          4
+#define WS2812_SPI_CLK_HZ 3000000  // 48MHz / 16 = 3MHz → ~750kbps WS2812
 
 // ---- Button ----
-#define BTN_PIN           PC1
+#define BTN_PIN           PC3
 #define BTN_DEBOUNCE_MS   30
 #define BTN_SHORT_MIN_MS  50
 #define BTN_SHORT_MAX_MS  500
@@ -60,7 +62,7 @@ The only module that requires low-level register access is the **WS2812 bit-bang
 #define BTN_LONG_MS       1000
 
 // ---- Battery ADC ----
-#define BATT_PIN          PD2
+#define BATT_PIN          PA2
 #define ADC_MAX           1023
 // Divider: BAT+ → 10k → VDETECT → 4k7 → GND  →  ratio = 4.7/(10+4.7) = 0.3197
 // Vref = 5.0V (buck-boost output).  vBatt = adcRaw * 5.0 / 1024 / 0.3197
@@ -115,8 +117,10 @@ static uint8_t  pwmDutyIndex = 0;         // 0-3=cycle, 4=100%
 // Button
 static uint32_t lastBtnSampleMs = 0;
 
-// WS2812 display buffer (GRB order)
+// WS2812 display buffer — color in GRB order (pre-expansion)
 static uint8_t ledBuf[NUM_LEDS][3];       // [i][0]=G, [i][1]=R, [i][2]=B
+// SPI output buffer — 24 color bits × 4 SPI-bits/color-bit / 8 = 12 bytes per LED
+static uint8_t spiBuf[NUM_LEDS * 12];     // 4 LEDs × 12 = 48 bytes
 static uint32_t lastDisplayMs = 0;
 static bool     displayDirty = true;
 ```
@@ -173,11 +177,10 @@ void setup() {
     // Button: input with internal pull-up
     pinMode(BTN_PIN, INPUT_PULLUP);
 
-    // WS2812 data: output, start low
-    pinMode(RGB_PIN, OUTPUT);
-    digitalWrite(RGB_PIN, LOW);
+    // WS2812 SPI (PC6 = MOSI): configured in ws2812_spi_begin()
+    // No digitalWrite needed — SPI hardware drives the pin
 
-    // Tach inputs: pull-up (open-drain from fan)
+    // Tach inputs: pull-up (open-drain from fan) — PD2 + PA1
     pinMode(TACH1_PIN, INPUT_PULLUP);
     pinMode(TACH2_PIN, INPUT_PULLUP);
 
@@ -187,6 +190,9 @@ void setup() {
     // PWM init (register-level, encapsulated)
     fanPWM_begin();
 
+    // SPI init for WS2812 (register-level, encapsulated)
+    ws2812_spi_begin();
+
     // Tach interrupts
     attachInterrupt(digitalPinToInterrupt(TACH1_PIN), tach1_ISR, RISING);
     attachInterrupt(digitalPinToInterrupt(TACH2_PIN), tach2_ISR, RISING);
@@ -195,7 +201,7 @@ void setup() {
 }
 ```
 
-> If `attachInterrupt()` is not available on PC7/PD3 in the specific Arduino core, fall back to configuring EXTI directly (small init block, same pattern as `fanPWM_begin`). The ISR bodies are identical either way.
+> If `attachInterrupt()` is not available on PD2/PA1 in the specific Arduino core, fall back to configuring EXTI directly (small init block, same pattern as `fanPWM_begin`). The ISR bodies are identical either way.
 
 ### 5. Non-Blocking Main Loop
 
@@ -299,46 +305,79 @@ static void button_poll(uint32_t now) {
 | Double click | Set `duty_index=4` → 100% |
 | Long press (>1s) | Fire immediately → 0% (cancels any pending clicks) |
 
-### 7. WS2812 Bit-Bang (the one low-level module)
+### 7. WS2812 via SPI (PC6 / SPI1_MOSI)
 
-`digitalWrite()` is too slow — direct register writes with cycle-accurate inline assembly inside `noInterrupts()`/`interrupts()`:
+**Why SPI over bit-bang:** Hardware SPI at 3 MHz eliminates interrupt blocking entirely. The bit-bang approach disables IRQs for ~172 µs per LED update, which causes tach pulse loss. SPI transfers happen autonomously in hardware — tach ISRs fire without interference. No inline assembly, no cycle counting, no calibration needed.
+
+**Principle** (from `drive ws2812 use spi.md`): Each WS2812 data bit is expanded to 4 SPI bits:
+- `1` → `1110` (3/4 HIGH, 1/4 LOW ≈ 1.0 µs / 0.33 µs)
+- `0` → `1000` (1/4 HIGH, 3/4 LOW ≈ 0.33 µs / 1.0 µs)
+
+SPI clock = 48 MHz / 16 = **3 MHz** → 1 SPI bit = 333 ns. Each WS2812 bit = 4 × 333 = 1.33 µs ≈ 750 kbps (within tolerance of the 800 kbps target). Verified working in practice.
+
+Each color byte (8 bits) → 4 SPI bytes (2 bits per SPI byte). One LED (GRB = 3 bytes) → 12 SPI bytes. 4 LEDs → **48 bytes** total.
+
+#### 7a. SPI initialization (called once in `setup()`)
 
 ```cpp
-// Cycle-accurate delay: ~(n) cycles (n must be even, 2 cycles/loop iter)
-#define DELAY_CYCLES(n) \
-    do { register uint32_t _c = (n) >> 1; \
-         __asm__ volatile("1: addi %0, %0, -1; bnez %0, 1b" \
-                          : "+r"(_c) : : "cc"); \
-    } while(0)
+static void ws2812_spi_begin() {
+    // Enable SPI1 + GPIOC clocks
+    RCC->APB2PCENR |= RCC_APB2Periph_SPI1 | RCC_APB2Periph_GPIOC;
 
-static void ws2812_send() {
-    noInterrupts();
-    for (uint8_t i = 0; i < NUM_LEDS; i++) {
-        uint32_t grb = ((uint32_t)ledBuf[i][0] << 16)  // G
-                     | ((uint32_t)ledBuf[i][1] << 8)   // R
-                     |  (uint32_t)ledBuf[i][2];         // B
-        for (int8_t b = 23; b >= 0; b--) {
-            if (grb & (1UL << b)) {
-                // Bit '1': T1H=~667ns, T1L=~583ns
-                GPIOC->BSHR = (1 << 2);   // HIGH, 1 cycle
-                DELAY_CYCLES(30);          // ~625ns
-                GPIOC->BCR = (1 << 2);    // LOW, 1 cycle
-                DELAY_CYCLES(26);          // ~542ns
-            } else {
-                // Bit '0': T0H=~333ns, T0L=~917ns
-                GPIOC->BSHR = (1 << 2);   // HIGH, 1 cycle
-                DELAY_CYCLES(14);          // ~292ns
-                GPIOC->BCR = (1 << 2);    // LOW, 1 cycle
-                DELAY_CYCLES(42);          // ~875ns
-            }
-        }
-    }
-    DELAY_CYCLES(2500);  // RESET > 50µs (~52µs)
-    interrupts();
+    // PC6 = alternate push-pull (SPI1_MOSI, GPIO Port C)
+    // Configure GPIOC CFGLR: PC6 → AF_PP, 50MHz
+    // (exact register writes depend on core header names)
+
+    // SPI1: master, TX-only, MSB first, baud = 48MHz/16 = 3MHz
+    SPI1->CTLR1 = SPI_CTLR1_MSTR | SPI_CTLR1_BR_DIV16 | SPI_CTLR1_MSB_FIRST;
+    SPI1->CTLR2 = 0;  // no NSS, no interrupts needed
+    SPI1->CTLR1 |= SPI_CTLR1_SPE;  // enable
 }
 ```
 
-> **Calibration:** These cycle counts are starting estimates. Verify with a logic analyzer and tune `DELAY_CYCLES` arguments until T0H/T0L/T1H/T1L are within spec. The BSHR/BCR register names match the CH32V003 GPIO peripheral.
+> Register field names match the CH32V003 Arduino core's `ch32v003_spi.h`. Adjust to the core's actual constants. The pattern is identical to what `fanPWM_begin()` does.
+
+#### 7b. Bit-expansion + SPI send
+
+```cpp
+// 4-entry LUT: maps 2 color bits → 1 SPI byte
+// Index = bits[1:0] from the color byte
+static const uint8_t ws2812LUT[4] = {
+    0x88,  // 00 → 1000_1000
+    0x8E,  // 01 → 1000_1110
+    0xE8,  // 10 → 1110_1000
+    0xEE,  // 11 → 1110_1110
+};
+
+static void ws2812_send() {
+    // Expand ledBuf[4][3] (GRB) → spiBuf[48]
+    uint8_t *out = spiBuf;
+    for (uint8_t i = 0; i < NUM_LEDS; i++) {
+        // Order: G, R, B (WS2812C expects Green first)
+        for (uint8_t comp = 0; comp < 3; comp++) {
+            uint8_t c = ledBuf[i][comp];
+            // Expand 8 bits → 4 SPI bytes (2 input bits per output byte)
+            for (uint8_t j = 0; j < 4; j++) {
+                *out++ = ws2812LUT[(c >> 6) & 0x03];
+                c <<= 2;
+            }
+        }
+    }
+
+    // Send all 48 bytes via SPI (hardware handles timing, no IRQs disabled)
+    for (uint8_t i = 0; i < sizeof(spiBuf); i++) {
+        while (!(SPI1->STATR & SPI_STATR_TXE));  // wait TX empty
+        SPI1->DATAR = spiBuf[i];
+    }
+    // Wait for last byte to finish
+    while (SPI1->STATR & SPI_STATR_BSY);
+
+    // RESET: hold MOSI low >50 µs before next frame
+    delayMicroseconds(60);
+}
+```
+
+> **No `noInterrupts()`!** SPI hardware runs autonomously. Tach ISRs fire freely during the 48-byte transfer (~128 µs at 3 MHz). Zero pulse loss.
 
 ### 8. Startup Sequence
 
@@ -620,7 +659,7 @@ Sections (in order):
 1. `#define` constants & pin assignments
 2. Global state variables (`static`)
 3. Low-level helper: `fanPWM_begin()` / `fanPWM_setDuty()` — register init, encapsulated
-4. Low-level helper: `ws2812_send()` + `DELAY_CYCLES()` — inline asm, encapsulated
+4. Low-level helper: `ws2812_spi_begin()` / `ws2812_send()` + `ws2812LUT[]` — SPI init + bit expansion
 5. Color helpers: `colorWheel()`, `rpmToColorIdx()`, `speedPalette[]`
 6. Battery helpers: `battery_detectCells()`, `battery_sample()`
 7. Tach ISRs + `tach_update()`
@@ -637,7 +676,7 @@ Sections (in order):
 | Step | What | Verify with |
 |------|------|------------|
 | 1 | `fanPWM_begin()` + `fanPWM_setDuty()` | Oscilloscope: 25 kHz on PD5/PD6, duty changes |
-| 2 | `ws2812_send()` with test pattern | Logic analyzer on PC2; visually on LEDs |
+| 2 | `ws2812_spi_begin()` + `ws2812_send()` with test pattern | Logic analyzer on PC6; visually on LEDs |
 | 3 | `colorWheel()` + rainbow animation | Visual: smooth rotation on all 4 LEDs |
 | 4 | `battery_detectCells()` + `battery_sample()` | Variable PSU: verify 1S/2S/3S detection |
 | 5 | `tach1_ISR()`/`tach2_ISR()` + `tach_update()` | Signal gen or real fan: verify RPM |
@@ -645,13 +684,13 @@ Sections (in order):
 | 7 | `display_update()` — gauge + speed overlay | Visual integration |
 | 8 | State machine: `startup_run`/`running_run`/`error_run` | Full system test |
 | 9 | `setup()` + `loop()` integration | End-to-end: power-up → rainbow → running → error |
-| 10 | Polish: calibrate WS2812 timing, tune brightness/colors | Final visual check |
 
 ## Verification
 
 1. **Oscilloscope:** 25 kHz PWM on PD5/PD6, duty responds to button gestures
-2. **Logic analyzer:** WS2812 T0H/T0L/T1H/T1L within datasheet spec
+2. **Logic analyzer:** Confirm SPI MOSI (PC6) waveform matches WS2812 timing — 3 MHz clock, correct bit patterns
 3. **Visual:** Rainbow animation rotates, error fast-blinks red, speed color transitions across RPM range
 4. **Fan test:** Real fans connected via CN1 or CN4, confirm tach read-back and single/dual detection
 5. **Battery test:** Variable DC supply at BAT+, verify 1S/2S/3S thresholds, gauge LED count, critical blink
 6. **Edge cases:** Power on with no battery → ERROR; power on with battery but no fans → ERROR; hot-plug fan during RUNNING → speed LED falls to blue
+7. **Tach integrity:** With SPI-driven WS2812, confirm zero tach pulse loss (scope on PD2/PA1 during WS2812 update — ISR must fire without delay)

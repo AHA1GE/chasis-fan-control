@@ -2,21 +2,22 @@
 
 ## MCU: CH32V003F4P6 (U1) — TSSOP-20
 
-| Pin | Net | GPIO | Function | Description |
-|-----|-----|------|----------|-------------|
-| 2 | `PWM_2` | PD6 | PWM output | Fan 2 PWM speed control |
-| 3 | `PWM_1` | PD5 | PWM output | Fan 1 PWM speed control |
-| 4 | `NRST` | NRST | Reset | Reset pin, also broken out to H1.4 |
-| 5 | `SPEED_2` | PD3 | Tach input | Fan 2 speed feedback (open-drain tach) |
-| 6 | `VDETECT` | PD2 | ADC input | Battery voltage sense (divider: 10k / 4.7k) |
-| 7 | `GND` | PD1 | GND | Tied to ground |
+| Physical Pin | Net | GPIO | Function | Description |
+|-------------|-----|------|----------|-------------|
+| 1 | `NRST` | PD7 | Reset | Reset pin, also broken out to H1.4 |
+| 2 | `PWM_2` | PD6 | TIM1_CH2 | Fan 2 PWM speed control (25 kHz) |
+| 3 | `PWM_1` | PD5 | TIM1_CH1 | Fan 1 PWM speed control (25 kHz) |
+| 6 | `SPEED_1` | PD2 | Tach input | Fan 1 speed feedback (open-drain tach) |
+| 7 | `SWD` | PD1 | SWIO | SWD debug/programming data → H1.3 |
+| 8 | `GND` | VSS | Power | Ground |
 | 9 | `+5V` | VDD | Power | 5 V supply from buck-boost converter |
-| 13 | `Btn` | PC1 | GPIO input | User button (active low, internal pull-up) |
-| 14 | `RGB` | PC2 | GPIO output | WS2812 data line (bit-banged) |
-| 18 | `SWD` | PC6 | SWIO | SWD debug data |
-| 19 | `SPEED_1` | PC7 | Tach input | Fan 1 speed feedback (open-drain tach) |
+| 10 | `VDETECT` | PA2 | ADC input | Battery voltage sense (divider: 10k / 4.7k) |
+| 11 | `SPEED_2` | PA1 | Tach input | Fan 2 speed feedback (open-drain tach) |
+| 15 | `Btn` | PC3 | GPIO input | User button (active low, internal pull-up) |
+| 18 | `RGB` | PC6 | SPI1_MOSI | WS2812 data via hardware SPI at 3 MHz |
+| 14 | `—` | PC2 | (spare) | Unused, available for future use |
 
-> **Note:** Pin numbers come from the EasyEDA netlist and align with the TSSOP-20 package pinout. GPIO port/pin names are derived from the CH32V003F4P6 datasheet; verify against the actual firmware `fanControl.ino` for the definitive `pinMode()` / `digitalPinToPort()` mapping.
+> **Note:** Physical pin numbers are the TSSOP-20 package pins. The EasyEDA schematic symbol uses arbitrary pin ordering that does not match the physical package — the table above maps netlist signals to the correct GPIO port/pin and physical pin.
 
 ---
 
@@ -69,18 +70,18 @@ All-in-one pinout combining SWD programming/debug with a reserved WS2812 extensi
 |-----|-----|----------|
 | 1 | `GND` | Ground |
 | 2 | `+5V` | 5 V supply (from buck-boost, powers the MCU) |
-| 3 | `SWD` | SWD data (SWIO) |
+| 3 | `SWD` | SWD data (SWIO, connected to PD1 / U1.7) |
 | 4 | `NRST` | Reset |
 | 5 | `RGB_EXT` | WS2812 passthrough from LED4 DOUT (reserved, no firmware function implemented) |
 
-> Standard WCH-LinkE / J-Link SWD header for programming and debugging CH32V003. Pin 5 carries the end of the on-board WS2812 daisy chain — available for a future external LED strip but currently unused in firmware.
+> Standard WCH-LinkE SWIO header for programming and debugging CH32V003 via PD1. Pin 5 carries the end of the on-board WS2812 daisy chain — available for a future external LED strip but currently unused in firmware.
 
 ---
 
 ## Battery Voltage Divider
 
 ```
-BAT+ ── R4 (10 kΩ) ──┬── VDETECT (U1.6 / PD2 ADC)
+BAT+ ── R4 (10 kΩ) ──┬── VDETECT (PA2 / ADC_IN2)
                      R5 (4.7 kΩ)
                       │
                      GND
@@ -92,19 +93,19 @@ BAT+ ── R4 (10 kΩ) ──┬── VDETECT (U1.6 / PD2 ADC)
 | 2S LiPo | 6.0 – 8.4 V | 1.92 – 2.69 V | MCU auto-detects cell count |
 | 3S LiPo | 9.0 – 12.6 V | 2.88 – 4.03 V | Max < 5 V ADC Vref |
 
-> **Auto-detection logic:** Read ADC on PD2 at boot. If VDETECT > 2.7 V → 3S; 1.8–2.7 V → 2S; < 1.6 V → 1S.
+> **Auto-detection logic:** Read ADC on PA2 at boot. If VDETECT > 2.7 V → 3S; 1.8–2.7 V → 2S; < 1.6 V → 1S.
 
 ---
 
 ## WS2812C RGB LED Daisy Chain
 
 ```
-MCU (PC2) ── RGB ── LED1.DIN ── LED1.DOUT ── LED2.DIN ── LED2.DOUT ── LED3.DIN ── LED3.DOUT ── LED4.DIN ── LED4.DOUT ── RGB_EXT (H1.5)
+MCU (PC6 / SPI1_MOSI) ── RGB ── LED1.DIN ── LED1.DOUT ── LED2.DIN ── LED2.DOUT ── LED3.DIN ── LED3.DOUT ── LED4.DIN ── LED4.DOUT ── RGB_EXT (H1.5)
 ```
 
 | LED | Designator | Net (DIN) | Net (DOUT) | Indicator Function |
 |-----|-----------|-----------|------------|-------------------|
-| 1 | LED1 | `RGB` (U1.14) | `$1N41` (→ LED2) | Battery 5%–25% |
+| 1 | LED1 | `RGB` (PC6) | `$1N41` (→ LED2) | Battery 5%–25% |
 | 2 | LED2 | `$1N41` | `$1N42` (→ LED3) | Battery 25%–50% |
 | 3 | LED3 | `$1N42` | `$1N43` (→ LED4) | Battery 50%–75% |
 | 4 | LED4 | `$1N43` | `RGB_EXT` (H1.5) | Battery 75%–100% |
@@ -148,7 +149,7 @@ Q1 (N-channel MOSFET, low-side):
 
 | Pin | Net | Notes |
 |-----|-----|-------|
-| 1, 2 | `Btn` | Connected to U1.13 (PC1), use internal pull-up |
+| 1, 2 | `Btn` | Connected to PC3, use internal pull-up |
 | 3, 4 | `GND` | Ground |
 
 Pressed = low. Software debounce required.
