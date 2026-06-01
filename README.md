@@ -79,24 +79,94 @@ Flip the slide switch to **OFF** — the MOSFET disconnects battery ground and t
 
 ## Firmware
 
-The firmware lives in [`fanControl/fanControl.ino`](fanControl/fanControl.ino) and is written for the Arduino / PlatformIO CH32V003 environment. Key implementation details:
+[`fanControl/fanControl.ino`](fanControl/fanControl.ino) — single-file firmware for the CH32V003 Arduino environment.
 
-- **PWM:** Hardware timers generate 25 kHz PWM on PD5 (Fan 1) and PD6 (Fan 2) — the Intel-standard PC fan frequency.
-- **Tach:** External interrupts on PC7 (Fan 1) and PD3 (Fan 2) count pulses; 2 pulses per revolution for standard fans. When both tach signals are alive the firmware uses a combined (averaged) reading; when only Fan 1 is connected (CN4) it falls back to `SPEED_1` directly.
-- **WS2812:** Bit-banged on PC2 using cycle-accurate assembly or the FastLED / NeoPixel library.
-- **Button:** Polled or interrupt-driven on PC1 with software debounce and gesture detection (single-click, double-click, long-press).
-- **ADC:** Periodic sampling on PD2 for battery voltage; cell-count auto-detection runs once at boot.
+> **⚠️ Status: freshly written, not yet tested on hardware.** The PCB has not been manufactured. The firmware compiles but has not been validated against real fans, batteries, or WS2812 LEDs. See [Testing](#testing) below.
+
+### Pin assignments
+
+| GPIO | Function | Detail |
+|------|----------|--------|
+| PD5 | Fan 1 PWM | TIM1_CH1, 25 kHz (PartialRemap1) |
+| PD6 | Fan 2 PWM | TIM1_CH2, 25 kHz |
+| PD2 | Fan 1 tach | EXTI2, rising-edge pulse counter |
+| PA1 | Fan 2 tach | EXTI1, rising-edge pulse counter |
+| PC6 | WS2812 data | SPI1_MOSI, 3 MHz hardware SPI (no IRQ blocking) |
+| PC3 | Button | Active-low, internal pull-up, polled in `loop()` |
+| PA2 | Battery ADC | 10-bit, 10k/4k7 divider, 1S–3S auto-detect |
+| PD1 | SWD (SWIO) | Programming/debug via H1 |
+| PD7 | NRST | Reset |
+
+### Implementation notes
+
+- **Arduino-first coding style** — `pinMode`, `digitalRead`, `analogRead`, `millis`, `delayMicroseconds` for all high-level logic. Register-level code is isolated to three init helpers (`pwm_begin`, `ws2812_begin`, `tach_begin`) called once in `setup()`.
+- **No interrupt blocking** — WS2812 is driven via hardware SPI at 3 MHz. The 48-byte transfer (4 LEDs × 3 colours × 4 SPI-bytes/colour) streams through `SPI1->DATAR` without disabling interrupts. Tach ISRs fire unimpeded.
+- **Button debounce** — polled every ~1 ms in `loop()`, 30-sample debounce counter. Edge detection with falling/rising transitions, single-click/double-click/long-press resolved by gap timeout.
+- **Tach** — `EXTI1_IRQHandler` (PA1) and `EXTI2_IRQHandler` (PD2) increment atomic pulse counters. Every 2 seconds the main loop snapshots and resets them, computing RPM = pulses × 15.
+- **Startup sequence** — 2 s rainbow animation → battery cell-count detection (4-sample averaged ADC) → spin fans at 100% for 500 ms → count tach pulses for 1 s → enter RUNNING or ERROR.
+
+### Display behaviour
+
+| What you see | Meaning |
+|-------------|---------|
+| 4× rainbow rotating (2 s) | Power-on startup |
+| All 4 LEDs fast-blink red (5 Hz) | Error: bad battery voltage OR no fans detected |
+| 1–4 LEDs dim white | Battery gauge: 1=5–25%, 2=25–50%, 3=50–75%, 4=75–100% |
+| Top LED colour: blue → cyan → green → yellow → red | Fan RPM low → high |
+| Top LED blinking off/on | Battery critically low (<10%) |
 
 ## Pin Reference
 
 See [**hardware/pins.md**](hardware/pins.md) for the complete pinout tables covering the MCU, connectors, voltage divider, LED chain, buck-boost, and power switching.
 
+## Implementation Plan
+
+See [**plan.md**](plan.md) for the full firmware architecture: state machine, module breakdown, SPI rationale, button timing thresholds, ADC voltage-divider math, and implementation order.
+
+## Testing
+
+The firmware is untested. When the board arrives, verify in this order:
+
+### 1. PWM (oscilloscope)
+Probe PD5 and PD6. Confirm 25 kHz, 0% duty at idle. Change duty via button and verify CCR matches `{0, 480, 960, 1440, 1919}` for `{0%, 25%, 50%, 75%, 100%}`.
+
+### 2. WS2812 (logic analyser)
+Probe PC6 (SPI1_MOSI). Verify 3 MHz clock, correct SPI byte stream (`0x88`/`0x8E`/`0xE8`/`0xEE` patterns), 48 bytes per frame, ≥50 µs reset gap. Visually confirm rainbow animation and solid colours.
+
+### 3. Battery ADC (variable DC supply)
+Apply known voltages to BAT+ and read `analogRead(PA2)`. Verify:
+- 1S detection: ADC 200–340
+- 2S detection: ADC 370–570
+- 3S detection: ADC > 570
+- Out-of-range → ERROR state with red fast-blink
+
+### 4. Tachometer (signal generator or real fan)
+Apply a 10–500 Hz square wave to PD2 and PA1. Confirm pulse counts match and RPM calculation is correct (RPM = pulses × 15 per 2 s window). Verify single-fan and dual-fan mode detection at startup.
+
+### 5. Button (serial debug or LED feedback)
+Test each gesture:
+- Single click → duty cycles 0→25→50→75→0%
+- Double click → duty jumps to 100%
+- Long press (hold >1 s) → duty snaps to 0% immediately
+
+### 6. End-to-end
+Full system test: power on → rainbow → battery gauge appears → button controls fan speed → speed colour tracks RPM → low battery triggers blink → power off.
+
+### Edge cases
+- Power on with no battery → ERROR
+- Power on with battery but no fans connected → ERROR
+- Hot-plug fan during RUNNING → speed LED falls to blue (0 RPM)
+- Power on at borderline ADC values (near 1S/2S boundary) → correct cell count
+
 ## Build & Flash
 
-1. Install the WCH CH32V003 toolchain (MounRiver Studio or the [ch32v003fun](https://github.com/cnlohr/ch32v003fun) open-source SDK).
-2. Open `fanControl/fanControl.ino` in the Arduino IDE with the CH32V003 board package, or use PlatformIO.
-3. Connect a WCH-LinkE (or J-Link) to H1: GND, 5V, SWD, NRST.
-4. Compile and upload.
+1. Install the [CH32V003 Arduino board package](https://github.com/openwch/arduino_core_ch32) or [ch32v003fun](https://github.com/cnlohr/ch32v003fun).
+2. Open `fanControl/fanControl.ino` in the Arduino IDE (or PlatformIO with the CH32V003 platform).
+3. Select board: **CH32V003F4P6**.
+4. Connect WCH-LinkE to H1: `GND – 5V – SWD(PD1) – NRST`.
+5. Compile and upload.
+
+> **Register-name compatibility:** The firmware uses WCH SPL register names (`TIM1->ATRLR`, `SPI1->CTLR1`, `AFIO->PCFR1`, etc.). If your Arduino core uses different names (e.g. `TIM1->ARR`, `SPI1->CR1`), adjust the three init helpers in sections 4, 5, and 8 of the firmware. `NVIC_EnableIRQ` may need to be replaced with `PFIC_EnableIRQ` depending on the core version.
 
 ## License
 
@@ -105,5 +175,6 @@ See [**hardware/pins.md**](hardware/pins.md) for the complete pinout tables cove
 ---
 
 *Schematic and PCB designed with EasyEDA Pro. MCU: WCH CH32V003F4P6 (QingKe V2 RISC-V).*
+*Firmware written June 2026 — awaiting hardware validation.*
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
