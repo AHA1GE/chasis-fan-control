@@ -14,7 +14,6 @@ The hardware (`hardware/pins.md`, `hardware/Netlist_fan-control.asc`) defines a 
 
 ## Code Style & Philosophy
 
-Follow the patterns in `referenceFirmware/ADC2PWM.ino`:
 - **Arduino API everywhere possible** — `pinMode()`, `digitalRead()`, `analogRead()`, `millis()`, `delay()`, `map()`, `noInterrupts()`/`interrupts()`, `attachInterrupt()`
 - **Lean helpers, not bare-metal sprawl** — encapsulate low-level init in small `static` functions or lightweight classes (like the `Servo` pattern); call them once in `setup()`, then use clean high-level calls in `loop()`
 - **`static` file-scope globals** — all state as static variables, no heap allocation
