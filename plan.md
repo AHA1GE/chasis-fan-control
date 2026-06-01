@@ -5,217 +5,594 @@
 The hardware (`hardware/pins.md`, `hardware/Netlist_fan-control.asc`) defines a dual-fan controller with:
 - CH32V003F4P6 MCU (48 MHz RISC-V, 16 KB flash, 2 KB SRAM)
 - 2× PWM outputs (PD5 = Fan1, PD6 = Fan2) at 25 kHz
-- 2× tachometer inputs (PC7 = Fan1, PD3 = Fan2) via EXTI pulse counting
+- 2× tachometer inputs (PC7 = Fan1, PD3 = Fan2) via interrupt pulse counting
 - 4× WS2812C LEDs daisy-chained on PC2 (battery gauge + speed indicator)
-- 1× button on PC1 (active-low) for speed selection
+- 1× button on PC1 (active-low, internal pull-up) for speed selection
 - ADC on PD2 for battery voltage (10k/4.7k divider), auto-detect 1S/2S/3S
-- Physical on/off via MOSFET + slide switch
-- Existing file `fanControl/fanControl.ino` contains servo-demo code (to be replaced)
-- Code style: bare-metal WCH Standard Peripheral Library (RCC, GPIO, TIM, ADC, EXTI, NVIC register-level calls)
+- Physical on/off via MOSFET + slide switch (no firmware involvement)
 
-## Implementation Strategy
+## Code Style & Philosophy
 
-**Single-file firmware** (`fanControl/fanControl.ino`), organized into clearly commented sections. Keep under ~16 KB flash / 2 KB SRAM.
+Follow the patterns in `referenceFirmware/ADC2PWM.ino`:
+- **Arduino API everywhere possible** — `pinMode()`, `digitalRead()`, `analogRead()`, `millis()`, `delay()`, `map()`, `noInterrupts()`/`interrupts()`, `attachInterrupt()`
+- **Lean helpers, not bare-metal sprawl** — encapsulate low-level init in small `static` functions or lightweight classes (like the `Servo` pattern); call them once in `setup()`, then use clean high-level calls in `loop()`
+- **`static` file-scope globals** — all state as static variables, no heap allocation
+- **`enum : uint8_t`** for compact state machines
+- **`#define` for all constants** at the top of the file
+- **Non-blocking `loop()`** — use `millis()` interval checks instead of `delay()` so the button stays responsive
+- **Optional debug toggles** — `#if ENABLE_SCREEN` pattern can be adapted for serial/screen debug if needed
 
-## Module Breakdown (in implementation order)
+The only module that requires low-level register access is the **WS2812 bit-bang** (cycle-accurate timing), and it is isolated to a single function wrapped in `noInterrupts()`/`interrupts()`. The **PWM timer** may need a small register-level init block (like the `Servo` library does internally), also encapsulated once in `setup()`.
+
+---
+
+## Module Breakdown
 
 ### 1. Pin Definitions & Constants
-- All pin macros, timing constants, duty table `{0, 25, 50, 75}`, ADC thresholds
-- GPIO remap: `GPIO_PinRemapConfig(GPIO_PartialRemap1_TIM1, ENABLE)` to route TIM1_CH1/CH2 to PD5/PD6
 
-### 2. Global State Structs
-```c
-typedef enum { STATE_STARTUP, STATE_RUNNING, STATE_ERROR } SystemState;
+```cpp
+// ---- Fan PWM ----
+#define PWM_FAN1_PIN      PD5   // TIM1_CH1 after PartialRemap1
+#define PWM_FAN2_PIN      PD6   // TIM1_CH2 after PartialRemap1
+#define PWM_FREQ_HZ       25000
+#define PWM_PERIOD        1919  // 48MHz / 25000 - 1
+#define DUTY_0_PERCENT    0
+#define DUTY_25_PERCENT   480
+#define DUTY_50_PERCENT   960
+#define DUTY_75_PERCENT   1440
+#define DUTY_100_PERCENT  1919
 
-typedef struct {
-    uint8_t cell_count;     // 0=invalid, 1, 2, 3
-    uint16_t adc_avg;       // filtered ADC reading
-    uint8_t  percent;       // 0-100 SoC
-    uint8_t  gauge_leds;    // 1-4 LEDs to light for gauge
-} BatteryState;
+// ---- Tachometer ----
+#define TACH1_PIN         PC7
+#define TACH2_PIN         PD3
+#define TACH_WINDOW_MS    2000   // RPM measurement interval
 
-typedef struct {
-    uint16_t rpm;           // averaged RPM (0 if stalled)
-    uint8_t  fan_mode;      // 1=single, 2=dual
-} FanState;
+// ---- WS2812 ----
+#define RGB_PIN           PC2
+#define NUM_LEDS          4
 
-typedef struct {
-    uint8_t duty_percent;   // 0, 25, 50, 75, 100
-    uint8_t duty_index;     // 0-3=cycle, 4=100%
-} PwmState;
+// ---- Button ----
+#define BTN_PIN           PC1
+#define BTN_DEBOUNCE_MS   30
+#define BTN_SHORT_MIN_MS  50
+#define BTN_SHORT_MAX_MS  500
+#define BTN_DOUBLE_GAP_MS 300
+#define BTN_LONG_MS       1000
 
-// WS2812 pixel in GRB order (WS2812C expects Green first)
-typedef struct { uint8_t g, r, b; } PixelGRB;
+// ---- Battery ADC ----
+#define BATT_PIN          PD2
+#define ADC_MAX           1023
+// Divider: BAT+ → 10k → VDETECT → 4k7 → GND  →  ratio = 4.7/(10+4.7) = 0.3197
+// Vref = 5.0V (buck-boost output).  vBatt = adcRaw * 5.0 / 1024 / 0.3197
+// Simplified integer math: vBatt_mV = adcRaw * 5000 * 147 / (1024 * 47)
+#define BATT_FULL_MV_PER_CELL   4200
+#define BATT_EMPTY_MV_PER_CELL  3000
+#define BATT_CRITICAL_MV_PER_CELL 3200
 
-typedef struct {
-    SystemState  state;
-    BatteryState battery;
-    FanState     fan;
-    PwmState     pwm;
-    PixelGRB     leds[4];
-    uint8_t      update_display;
-    uint32_t     tick_ms;
-} SystemContext;
+// Cell-detect ADC thresholds (10-bit, Vref=5V):
+#define ADC_3S_THRESHOLD   570   // >570 → 3S
+#define ADC_2S_THRESHOLD   370   // 370-570 → 2S
+#define ADC_1S_THRESHOLD   200   // 200-340 → 1S (below 200 = invalid)
+
+// ---- Display update intervals ----
+#define ADC_INTERVAL_MS    200
+#define DISPLAY_INTERVAL_MS 100
+#define RAINBOW_FRAME_MS   50
+#define RAINBOW_DURATION_MS 2000
+
+// ---- Duty cycle table (single-click cycling) ----
+static const uint8_t dutyCycleTable[4] = { 0, 25, 50, 75 };
 ```
 
-### 3. GPIO Initialization
-- PC1: input w/ pull-up (button)
-- PC2: push-pull output (WS2812 data)
-- PC7: input w/ pull-up (Fan 1 tach)
-- PD2: analog input (battery ADC)
-- PD3: input w/ pull-up (Fan 2 tach)
-- PD5, PD6: AF push-pull (PWM — set in PWM init)
+### 2. Global State
 
-### 4. PWM (TIM1, 25 kHz)
-```
-TIM1 clock = 48 MHz
-TIM_Prescaler = 0
-TIM_Period = 1919  →  48 MHz / 1920 = 25 kHz exactly
-Resolution: 1920 steps (~0.052% per step)
+```cpp
+enum SystemState : uint8_t {
+    STATE_STARTUP = 0,
+    STATE_RUNNING,
+    STATE_ERROR
+};
+static SystemState systemState = STATE_STARTUP;
 
-Duty table (CCR values):
-  0%   → 0
-  25%  → 480
-  50%  → 960
-  75%  → 1440
-  100% → 1919
-```
-- CH1 (PD5) = Fan 1, CH2 (PD6) = Fan 2, both PWM mode 1, active-high
-- Both channels always set to same duty cycle
-- `TIM_CtrlPWMOutputs(TIM1, ENABLE)` required for MOE bit
+// Battery
+static uint8_t  battCellCount = 0;    // 0=invalid, 1, 2, 3
+static uint16_t battAdcAvg = 0;       // rolling average ADC value
+static uint8_t  battPercent = 0;      // 0-100 SoC
+static uint8_t  battGaugeLeds = 0;    // 0-4 LEDs lit for gauge
+static uint32_t lastAdcMs = 0;
 
-**Critically: `GPIO_PinRemapConfig(GPIO_PartialRemap1_TIM1, ENABLE)`** — needed to route TIM1_CH1 to PD5 and TIM1_CH2 to PD6 (default mapping is PA8/PA9 which don't exist on TSSOP-20).
+// Fan / tach
+static volatile uint16_t tachPulses1 = 0;  // incremented in ISR
+static volatile uint16_t tachPulses2 = 0;
+static uint16_t fanRpm = 0;
+static uint8_t  fanMode = 0;              // 1=single, 2=dual
+static uint32_t lastTachMs = 0;
 
-### 5. SysTick (1 ms)
-- `SysTick_Config(SystemCoreClock / 1000)` for 1 ms tick
-- Handler: increments `system_tick_ms`, calls `button_tick()`, updates `ctx.tick_ms`
-- Priority 0 (highest) — must not be preempted by EXTI
+// PWM
+static uint8_t  pwmDutyPercent = 0;
+static uint8_t  pwmDutyIndex = 0;         // 0-3=cycle, 4=100%
 
-### 6. Button Gesture Detection (PC1)
-Timing thresholds:
-| Parameter | Value |
-|-----------|-------|
-| Debounce | 30 ms |
-| Short press min | 50 ms |
-| Short press max | 500 ms |
-| Double-click gap | 300 ms (max between releases) |
-| Long press | 1000 ms |
+// Button
+static uint32_t lastBtnSampleMs = 0;
 
-State machine (processed every 1 ms from SysTick):
-- Tracks raw → debounced state (30 consecutive matching samples)
-- Detects falling edge (press start), rising edge (release)
-- On release: if held 50-500 ms → increment `pending_clicks`
-- While held > 1000 ms → fire long-press (set duty=0%, duty_index=0) — fire ONLY once per hold
-- After release + 300 ms of silence:
-  - `pending_clicks == 1` → single-click: cycle duty_index (0→1→2→3→0)
-  - `pending_clicks >= 2` → double-click: duty_index=4, duty=100%
-
-### 7. WS2812 Bit-Bang (PC2)
-**Critical:** interrupts disabled during entire transmission (~172 µs for 4 LEDs).
-
-Timing at 48 MHz (WS2812C spec: T0H=200-500ns, T0L=650-950ns, T1H=550-850ns, T1L=450-750ns, RESET>50µs):
-```
-Bit '0': HIGH 16 cycles (333ns) + LOW 44 cycles (917ns) = 60 cycles
-Bit '1': HIGH 32 cycles (667ns) + LOW 28 cycles (583ns) = 60 cycles
-Total per LED: 24 bits × 60 = 1440 cycles ≈ 30 µs
-4 LEDs: 120 µs + 52 µs reset ≈ 172 µs IRQs off
-```
-- Pure inline assembly with NOP padding for cycle accuracy
-- `delay_cycles(n)` macro: `addi + bnez` loop (2 cycles/iter)
-- Calibrate with oscilloscope — adjust constants if needed
-- Byte order: **G, R, B** (WS2812C-specific)
-- `ws2812_send_buffer(ctx.leds)` sends all 4 pixels in one critical section
-
-### 8. Startup Rainbow Animation
-- HSV color wheel, 256 positions
-- 4 LEDs offset by 64 (90° apart)
-- Every 50 ms: advance by 8 positions → smooth rotation
-- 40 frames × 50 ms = 2 seconds total
-- Runs in STARTUP state, renders via `ws2812_send_buffer()`
-
-### 9. ADC & Battery Detection (PD2)
-Divider: VDETECT = BAT+ × 4.7k / (10k + 4.7k) = BAT+ × 0.3197
-
-Cell detection (averaged over 4 samples at boot):
-| Cells | VDETECT range | ADC range (10-bit, Vref=5V) |
-|-------|---------------|---------------------------|
-| 1S | 0.96 – 1.34 V | 196 – 275 |
-| 2S | 1.92 – 2.69 V | 393 – 551 |
-| 3S | 2.88 – 4.03 V | 590 – 825 |
-
-Thresholds with guard-bands: ADC > 570 → 3S; 370–570 → 2S; 200–340 → 1S; else → invalid (error)
-
-SoC per cell: `(V_cell - 3.0) / 1.2 × 100`, clamped 0–100.
-Gauge LED count: <5%=0 (critical), 5-25%=1, 25-50%=2, 50-75%=3, 75-100%=4.
-
-In RUNNING: sample ADC every 200 ms, 4-sample rolling average. Cell count locked at boot (no dynamic re-detection).
-
-### 10. Tachometer (PC7 + PD3)
-- EXTI on both pins, rising edge, priority 1
-- ISRs increment `volatile uint16_t` counters
-- Every 2 seconds: capture counters atomically, compute delta, RPM = delta × 15
-  (60 s/min ÷ 2 pulses/rev ÷ 2 s window = 15)
-- Dual fan: RPM = (rpm1 + rpm2) / 2; Single fan: RPM = rpm1
-- Startup detection: PWM=100% for 500ms, count pulses for 1s. If both >3: dual. If only PC7 >3: single. If both ≤3: error.
-
-IRQ impact from WS2812 (~172µs every 100ms): at worst (<1% pulse loss) — negligible for RPM accuracy.
-
-### 11. Display Compute Logic (RUNNING, every 100ms)
-```
-For i = 0..3:
-  if i < gauge_leds:
-    leds[i] = dim white (brightness scales with i)
-  else:
-    leds[i] = off
-
-"Upper" LED (index = gauge_leds - 1) overwritten with speed color:
-  RPM color map (5 bins): blue → cyan → green → yellow → red
-  (0-1000, 1000-2000, 2000-3000, 3000-5000, 5000+)
-
-Critical battery (<10%): blink the last gauge LED at 500ms period.
+// WS2812 display buffer (GRB order)
+static uint8_t ledBuf[NUM_LEDS][3];       // [i][0]=G, [i][1]=R, [i][2]=B
+static uint32_t lastDisplayMs = 0;
+static bool     displayDirty = true;
 ```
 
-### 12. Error Handling
-**Enter ERROR state if at startup:**
-- Battery voltage not in valid range for any cell count (ADC outside 200-825), **OR**
-- Both tach signals show 0 pulses after 100% PWM for 500ms + 1s measurement
+### 3. Fan PWM Helper (encapsulated low-level init)
 
-**ERROR state behavior:**
-- All 4 LEDs fast-blink red at **~5 Hz** (100ms on, 100ms off) — visually distinct "fast blink"
-- PWM stays at 0%
-- No button or ADC processing
-- Only exit: power cycle
+Like the reference `Servo` class, a small static helper configures TIM1 once in `setup()`. The actual duty updates in `loop()` use simple register writes.
 
-### 13. Main Loop
-```c
+```cpp
+static void fanPWM_begin() {
+    // Enable GPIOD + TIM1 clocks
+    RCC->APB2PCENR |= RCC_APB2Periph_GPIOD | RCC_APB2Periph_TIM1;
+
+    // PD5, PD6 as alternate push-pull (needed even with remap)
+    // ... configure GPIOD CFGLR for PD5=AF_PP, PD6=AF_PP
+
+    // Remap TIM1_CH1→PD5, TIM1_CH2→PD6
+    AFIO->PCFR1 |= AFIO_PCFR1_TIM1_REMAP_PARTIAL1;
+
+    // TIM1: 48 MHz, prescaler=0, period=1919 → 25 kHz
+    TIM1->PSC = 0;
+    TIM1->ATRLR = PWM_PERIOD;
+    TIM1->CNT = 0;
+
+    // CH1 + CH2: PWM mode 1, active high, preload enabled
+    TIM1->CHCTLR1 = TIM_OCMode_PWM1 | TIM_OCPreload_Enable;  // CH1
+    TIM1->CHCTLR2 = TIM_OCMode_PWM1 | TIM_OCPreload_Enable;  // CH2
+    TIM1->CCER |= TIM_CCx_Enable(CH1) | TIM_CCx_Enable(CH2);
+
+    // Set 0% duty initially
+    TIM1->CH1CVR = 0;
+    TIM1->CH2CVR = 0;
+
+    // Main output enable + start
+    TIM1->BDTR |= TIM_BDTR_MOE;
+    TIM1->CTLR1 |= TIM_CEN;
+}
+
+static void fanPWM_setDuty(uint8_t percent) {
+    uint16_t ccr = (uint16_t)((uint32_t)percent * PWM_PERIOD / 100);
+    TIM1->CH1CVR = ccr;
+    TIM1->CH2CVR = ccr;
+}
+```
+
+> **Note:** The exact register names depend on the CH32V003 Arduino core headers. Adjust to match `ch32v003_gpio.h` / `ch32v003_tim.h` field names. The pattern is identical to what `CH32V003_SERVO.h` does internally, just with different TIM1 parameters (25 kHz vs 50 Hz).
+
+### 4. GPIO Initialization (`setup()`)
+
+Uses Arduino `pinMode()` everywhere:
+
+```cpp
+void setup() {
+    // Button: input with internal pull-up
+    pinMode(BTN_PIN, INPUT_PULLUP);
+
+    // WS2812 data: output, start low
+    pinMode(RGB_PIN, OUTPUT);
+    digitalWrite(RGB_PIN, LOW);
+
+    // Tach inputs: pull-up (open-drain from fan)
+    pinMode(TACH1_PIN, INPUT_PULLUP);
+    pinMode(TACH2_PIN, INPUT_PULLUP);
+
+    // Battery ADC: analog input
+    pinMode(BATT_PIN, INPUT_ANALOG);
+
+    // PWM init (register-level, encapsulated)
+    fanPWM_begin();
+
+    // Tach interrupts
+    attachInterrupt(digitalPinToInterrupt(TACH1_PIN), tach1_ISR, RISING);
+    attachInterrupt(digitalPinToInterrupt(TACH2_PIN), tach2_ISR, RISING);
+
+    systemState = STATE_STARTUP;
+}
+```
+
+> If `attachInterrupt()` is not available on PC7/PD3 in the specific Arduino core, fall back to configuring EXTI directly (small init block, same pattern as `fanPWM_begin`). The ISR bodies are identical either way.
+
+### 5. Non-Blocking Main Loop
+
+```cpp
 void loop() {
-    uint32_t now = ctx.tick_ms;
-    switch (ctx.state) {
+    uint32_t now = millis();
+
+    switch (systemState) {
         case STATE_STARTUP:
-            // Run 2s rainbow animation, then battery+fan checks
-            // Transition to RUNNING or ERROR
+            startup_run(now);
             break;
         case STATE_RUNNING:
-            // 1. ADC sample every 200ms
-            // 2. Tach RPM calculation every 2000ms
-            // 3. Display update every 100ms (or on duty change)
+            running_run(now);
             break;
         case STATE_ERROR:
-            // Blink all red at 5 Hz (100ms period)
+            error_run(now);
             break;
     }
 }
 ```
-CPU idle >99.8% of the time.
 
-### 14. ISR Priority Assignment
-| Interrupt | Priority | Rationale |
-|-----------|----------|-----------|
-| SysTick | 0 (highest) | 1ms button timing must not drift |
-| EXTI3 (tach2) | 1 | Tach pulses must not be missed |
-| EXTI7 (tach1) | 1 | Shared EXTI5_9 vector, same priority |
+No `delay()` calls — each subsystem checks `millis()` intervals.
 
-## State Machine Diagram
+### 6. Button Gesture Detection (polled in `running_run`)
+
+Since `loop()` runs continuously without blocking, button is sampled every ~2ms:
+
+```cpp
+static void button_poll(uint32_t now) {
+    // Limit sampling rate to ~1ms for debounce counting
+    if (now - lastBtnSampleMs < 1) return;
+    lastBtnSampleMs = now;
+
+    static uint8_t  raw = HIGH, lastRaw = HIGH;
+    static uint8_t  debounced = HIGH, lastDebounced = HIGH;
+    static uint8_t  debounceCnt = 0;
+    static uint32_t pressStartMs = 0;
+    static uint32_t lastReleaseMs = 0;
+    static uint8_t  pendingClicks = 0;
+    static bool     longFired = false;
+
+    raw = digitalRead(BTN_PIN);  // LOW = pressed
+
+    // Debounce: count consecutive same-samples
+    if (raw == lastRaw) {
+        if (debounceCnt < BTN_DEBOUNCE_MS) debounceCnt++;
+    } else {
+        debounceCnt = 0;
+    }
+    lastRaw = raw;
+    if (debounceCnt >= BTN_DEBOUNCE_MS) debounced = raw;
+
+    // Falling edge → press started
+    if (debounced == LOW && lastDebounced == HIGH) {
+        pressStartMs = now;
+        longFired = false;
+    }
+    // Rising edge → released
+    if (debounced == HIGH && lastDebounced == LOW) {
+        uint32_t held = now - pressStartMs;
+        if (held >= BTN_SHORT_MIN_MS && held <= BTN_SHORT_MAX_MS) {
+            pendingClicks++;
+        }
+        lastReleaseMs = now;
+    }
+    lastDebounced = debounced;
+
+    // Long press while held (fire once)
+    if (debounced == LOW && !longFired && (now - pressStartMs) > BTN_LONG_MS) {
+        longFired = true;
+        pendingClicks = 0;          // cancel any pending clicks
+        pwmDutyIndex = 0;
+        pwmDutyPercent = dutyCycleTable[0];
+        fanPWM_setDuty(0);
+        displayDirty = true;
+    }
+
+    // Resolve gestures after double-click gap timeout
+    if (pendingClicks > 0 && (now - lastReleaseMs) > BTN_DOUBLE_GAP_MS) {
+        if (pendingClicks == 1) {
+            // Single click → cycle 0→25→50→75
+            pwmDutyIndex = (pwmDutyIndex + 1) % 4;
+            pwmDutyPercent = dutyCycleTable[pwmDutyIndex];
+        } else {
+            // Double click → 100%
+            pwmDutyIndex = 4;
+            pwmDutyPercent = 100;
+        }
+        fanPWM_setDuty(pwmDutyPercent);
+        displayDirty = true;
+        pendingClicks = 0;
+    }
+}
+```
+
+**Gesture-to-action map:**
+
+| Gesture | Action |
+|---------|--------|
+| Single click | Cycle `duty_index` (0→1→2→3→0) → 0%, 25%, 50%, 75% |
+| Double click | Set `duty_index=4` → 100% |
+| Long press (>1s) | Fire immediately → 0% (cancels any pending clicks) |
+
+### 7. WS2812 Bit-Bang (the one low-level module)
+
+`digitalWrite()` is too slow — direct register writes with cycle-accurate inline assembly inside `noInterrupts()`/`interrupts()`:
+
+```cpp
+// Cycle-accurate delay: ~(n) cycles (n must be even, 2 cycles/loop iter)
+#define DELAY_CYCLES(n) \
+    do { register uint32_t _c = (n) >> 1; \
+         __asm__ volatile("1: addi %0, %0, -1; bnez %0, 1b" \
+                          : "+r"(_c) : : "cc"); \
+    } while(0)
+
+static void ws2812_send() {
+    noInterrupts();
+    for (uint8_t i = 0; i < NUM_LEDS; i++) {
+        uint32_t grb = ((uint32_t)ledBuf[i][0] << 16)  // G
+                     | ((uint32_t)ledBuf[i][1] << 8)   // R
+                     |  (uint32_t)ledBuf[i][2];         // B
+        for (int8_t b = 23; b >= 0; b--) {
+            if (grb & (1UL << b)) {
+                // Bit '1': T1H=~667ns, T1L=~583ns
+                GPIOC->BSHR = (1 << 2);   // HIGH, 1 cycle
+                DELAY_CYCLES(30);          // ~625ns
+                GPIOC->BCR = (1 << 2);    // LOW, 1 cycle
+                DELAY_CYCLES(26);          // ~542ns
+            } else {
+                // Bit '0': T0H=~333ns, T0L=~917ns
+                GPIOC->BSHR = (1 << 2);   // HIGH, 1 cycle
+                DELAY_CYCLES(14);          // ~292ns
+                GPIOC->BCR = (1 << 2);    // LOW, 1 cycle
+                DELAY_CYCLES(42);          // ~875ns
+            }
+        }
+    }
+    DELAY_CYCLES(2500);  // RESET > 50µs (~52µs)
+    interrupts();
+}
+```
+
+> **Calibration:** These cycle counts are starting estimates. Verify with a logic analyzer and tune `DELAY_CYCLES` arguments until T0H/T0L/T1H/T1L are within spec. The BSHR/BCR register names match the CH32V003 GPIO peripheral.
+
+### 8. Startup Sequence
+
+```cpp
+static void startup_run(uint32_t now) {
+    static uint32_t startMs = 0;
+    static uint8_t  frame = 0;
+    static uint32_t lastFrameMs = 0;
+
+    // Init on first call
+    if (startMs == 0) {
+        startMs = now;
+        lastFrameMs = now;
+        frame = 0;
+        fanPWM_setDuty(0);  // fans off during animation
+    }
+
+    // Rainbow animation (2 seconds)
+    if (frame < (RAINBOW_DURATION_MS / RAINBOW_FRAME_MS)) {
+        if (now - lastFrameMs >= RAINBOW_FRAME_MS) {
+            lastFrameMs = now;
+            for (uint8_t i = 0; i < NUM_LEDS; i++) {
+                uint8_t pos = (frame * 8 + i * 64) & 0xFF;
+                colorWheel(pos, ledBuf[i]);
+            }
+            ws2812_send();
+            frame++;
+        }
+        return;
+    }
+
+    // Animation done — run checks
+    battCellCount = battery_detectCells();  // 4-sample avg ADC
+
+    // Fan presence: 100% PWM for 500ms, count tach for 1s
+    fanPWM_setDuty(100);
+    delay(500);
+    noInterrupts();
+    tachPulses1 = 0;
+    tachPulses2 = 0;
+    interrupts();
+    delay(1000);
+    noInterrupts();
+    uint16_t c1 = tachPulses1, c2 = tachPulses2;
+    tachPulses1 = tachPulses2 = 0;
+    interrupts();
+    fanPWM_setDuty(0);
+
+    if (c1 > 3 && c2 > 3)      fanMode = 2;
+    else if (c1 > 3)           fanMode = 1;
+    else                       fanMode = 0;
+
+    // Error check
+    if (battCellCount == 0 || fanMode == 0) {
+        systemState = STATE_ERROR;
+        return;
+    }
+
+    // Success → RUNNING
+    systemState = STATE_RUNNING;
+    displayDirty = true;
+}
+```
+
+`colorWheel()` — HSV→RGB for rainbow (same algorithm as plan v1, returning `{g, r, b}` for GRB order).
+
+### 9. Battery ADC (Arduino `analogRead`)
+
+```cpp
+static uint8_t battery_detectCells() {
+    uint32_t sum = 0;
+    for (int i = 0; i < 4; i++) sum += analogRead(BATT_PIN);
+    uint16_t avg = (uint16_t)(sum >> 2);
+
+    if (avg > ADC_3S_THRESHOLD)      return 3;
+    else if (avg > ADC_2S_THRESHOLD) return 2;
+    else if (avg > ADC_1S_THRESHOLD) return 1;
+    else                             return 0;  // invalid
+}
+
+static void battery_sample() {
+    uint16_t raw = analogRead(BATT_PIN);
+    // Rolling average: 4-sample
+    static uint16_t buf[4] = {0};
+    static uint8_t idx = 0;
+    buf[idx] = raw;
+    idx = (idx + 1) & 3;
+    battAdcAvg = (buf[0] + buf[1] + buf[2] + buf[3]) >> 2;
+
+    // Compute battery mV:  vBatt = adc * 5000mV * (10k+4.7k) / (1024 * 4.7k)
+    uint32_t vBattMv = ((uint32_t)battAdcAvg * 5000UL * 147UL) / (1024UL * 47UL);
+    uint32_t vCellMv = vBattMv / battCellCount;
+
+    // SoC per cell: 0% at 3.0V, 100% at 4.2V
+    battPercent = (uint8_t)constrain(
+        map((long)vCellMv, BATT_EMPTY_MV_PER_CELL, BATT_FULL_MV_PER_CELL, 0L, 100L),
+        0L, 100L
+    );
+
+    // Gauge LED count
+    if      (battPercent >= 75) battGaugeLeds = 4;
+    else if (battPercent >= 50) battGaugeLeds = 3;
+    else if (battPercent >= 25) battGaugeLeds = 2;
+    else if (battPercent >= 5)  battGaugeLeds = 1;
+    else                        battGaugeLeds = 0;  // critical low
+}
+```
+
+### 10. Tachometer ISRs
+
+```cpp
+static void tach1_ISR() { tachPulses1++; }
+static void tach2_ISR() { tachPulses2++; }
+```
+
+RPM computation (called every `TACH_WINDOW_MS` in `running_run`):
+
+```cpp
+static void tach_update() {
+    noInterrupts();
+    uint16_t c1 = tachPulses1, c2 = tachPulses2;
+    tachPulses1 = tachPulses2 = 0;
+    interrupts();
+
+    // RPM = pulses * 60 / (2 pulses/rev * window_seconds)
+    uint16_t rpm1 = c1 * (60000UL / (2 * TACH_WINDOW_MS));
+    uint16_t rpm2 = c2 * (60000UL / (2 * TACH_WINDOW_MS));
+
+    if (fanMode == 2) fanRpm = (rpm1 + rpm2) / 2;
+    else              fanRpm = rpm1;
+}
+```
+
+With 2-second window: `RPM = pulses × 15`.
+
+### 11. Display Compute (RUNNING state, every 100ms)
+
+```cpp
+// Speed color palette (GRB order)
+static const uint8_t speedPalette[5][3] = {
+    {0,   0,   128},   // Blue   (0-1000 RPM)
+    {128, 0,   128},   // Cyan   (1000-2000)
+    {128, 0,   0  },   // Green  (2000-3000)
+    {128, 128, 0  },   // Yellow (3000-5000)
+    {0,   128, 0  },   // Red    (5000+)
+};
+
+static uint8_t rpmToColorIdx(uint16_t rpm) {
+    if (rpm < 1000) return 0;
+    if (rpm < 2000) return 1;
+    if (rpm < 3000) return 2;
+    if (rpm < 5000) return 3;
+    return 4;
+}
+
+static void display_update(uint32_t now) {
+    if (!displayDirty && (now - lastDisplayMs < DISPLAY_INTERVAL_MS)) return;
+    lastDisplayMs = now;
+    displayDirty = false;
+
+    // Fill gauge LEDs as dim white
+    for (uint8_t i = 0; i < NUM_LEDS; i++) {
+        if (i < battGaugeLeds) {
+            uint8_t bright = 24 + i * 16;  // increasing brightness
+            ledBuf[i][0] = bright;  // G
+            ledBuf[i][1] = bright;  // R
+            ledBuf[i][2] = bright;  // B  → dim white
+        } else {
+            ledBuf[i][0] = ledBuf[i][1] = ledBuf[i][2] = 0;
+        }
+    }
+
+    // Overlay "upper" (last lit) LED with speed color
+    if (battGaugeLeds > 0) {
+        uint8_t upper = battGaugeLeds - 1;
+        uint8_t ci = rpmToColorIdx(fanRpm);
+        ledBuf[upper][0] = speedPalette[ci][0];
+        ledBuf[upper][1] = speedPalette[ci][1];
+        ledBuf[upper][2] = speedPalette[ci][2];
+    }
+
+    // Critical battery blink (<10%): flash last LED off at 2Hz
+    if (battPercent < 10 && battGaugeLeds <= 1) {
+        if ((now / 250) & 1) {  // 250ms on, 250ms off
+            ledBuf[0][0] = ledBuf[0][1] = ledBuf[0][2] = 0;
+        }
+    }
+
+    ws2812_send();
+}
+```
+
+### 12. RUNNING State (`running_run`)
+
+```cpp
+static void running_run(uint32_t now) {
+    button_poll(now);
+
+    if (now - lastAdcMs >= ADC_INTERVAL_MS) {
+        lastAdcMs = now;
+        battery_sample();
+        displayDirty = true;
+    }
+
+    if (now - lastTachMs >= TACH_WINDOW_MS) {
+        lastTachMs = now;
+        tach_update();
+        displayDirty = true;
+    }
+
+    display_update(now);
+}
+```
+
+### 13. ERROR State
+
+```cpp
+static void error_run(uint32_t now) {
+    // Fast blink all 4 LEDs red at ~5 Hz (100ms period)
+    static uint32_t lastBlinkMs = 0;
+    static bool on = false;
+
+    if (now - lastBlinkMs >= 100) {
+        lastBlinkMs = now;
+        on = !on;
+        for (uint8_t i = 0; i < NUM_LEDS; i++) {
+            ledBuf[i][0] = 0;       // G=0
+            ledBuf[i][1] = on ? 128 : 0;  // R
+            ledBuf[i][2] = 0;       // B=0
+        }
+        ws2812_send();
+    }
+
+    // PWM stays at 0%, button ignored, only exit is power cycle
+}
+```
+
+### 14. Display Behavior Summary
+
+| What you see | Meaning |
+|-------------|---------|
+| 4× rainbow rotating (2s) | Power-on startup |
+| All 4 red fast blink (5 Hz) | Error: bad battery OR no fans detected |
+| 1 LED white | Battery 5–25% |
+| 2 LEDs white | Battery 25–50% |
+| 3 LEDs white | Battery 50–75% |
+| 4 LEDs white | Battery 75–100% |
+| Top LED = blue → cyan → green → yellow → red | Fan RPM low → high |
+| Top LED blinking off/on | Battery critically low (<10%) |
+
+---
+
+## State Machine
+
 ```
 [POWER ON]
     |
@@ -229,25 +606,52 @@ CPU idle >99.8% of the time.
                        | fast  |
                        | blink |
                        | red   |
+                       | 5 Hz  |
                        +-------+
 ```
 
+---
+
+## File Structure
+
+Single file: `fanControl/fanControl.ino`
+
+Sections (in order):
+1. `#define` constants & pin assignments
+2. Global state variables (`static`)
+3. Low-level helper: `fanPWM_begin()` / `fanPWM_setDuty()` — register init, encapsulated
+4. Low-level helper: `ws2812_send()` + `DELAY_CYCLES()` — inline asm, encapsulated
+5. Color helpers: `colorWheel()`, `rpmToColorIdx()`, `speedPalette[]`
+6. Battery helpers: `battery_detectCells()`, `battery_sample()`
+7. Tach ISRs + `tach_update()`
+8. Button: `button_poll()`
+9. Display: `display_update()`
+10. State runners: `startup_run()`, `running_run()`, `error_run()`
+11. `setup()` — Arduino pinMode + one-time inits
+12. `loop()` — dispatch to state runner
+
+---
+
 ## Implementation Order
-1. GPIO init + PWM (verify 25 kHz on PD5/PD6 with scope)
-2. SysTick (1ms, verify with GPIO toggle)
-3. Button gesture (verify with debug LED patterns)
-4. WS2812 send function (verify with single test pattern)
-5. Rainbow animation (visual confirmation)
-6. ADC + battery detection (verify thresholds)
-7. Tachometer EXTI + RPM calc (verify with signal generator or fan)
-8. Display compute (gauge + speed color integration)
-9. Main loop + state machine
-10. Error handling + final integration
+
+| Step | What | Verify with |
+|------|------|------------|
+| 1 | `fanPWM_begin()` + `fanPWM_setDuty()` | Oscilloscope: 25 kHz on PD5/PD6, duty changes |
+| 2 | `ws2812_send()` with test pattern | Logic analyzer on PC2; visually on LEDs |
+| 3 | `colorWheel()` + rainbow animation | Visual: smooth rotation on all 4 LEDs |
+| 4 | `battery_detectCells()` + `battery_sample()` | Variable PSU: verify 1S/2S/3S detection |
+| 5 | `tach1_ISR()`/`tach2_ISR()` + `tach_update()` | Signal gen or real fan: verify RPM |
+| 6 | `button_poll()` | Serial print or LED blink: single/double/long |
+| 7 | `display_update()` — gauge + speed overlay | Visual integration |
+| 8 | State machine: `startup_run`/`running_run`/`error_run` | Full system test |
+| 9 | `setup()` + `loop()` integration | End-to-end: power-up → rainbow → running → error |
+| 10 | Polish: calibrate WS2812 timing, tune brightness/colors | Final visual check |
 
 ## Verification
-1. **Oscilloscope:** Confirm 25 kHz PWM on PD5/PD6, verify duty cycle changes with button
-2. **Logic analyzer:** Calibrate WS2812 bit timing (T0H/T0L/T1H/T1L within spec)
-3. **Visual:** Rainbow animation rotates smoothly, error blink is fast and clearly red
-4. **Fan test:** Connect real fans, confirm RPM read-back and speed color mapping
-5. **Battery test:** Power board from variable supply, verify cell-count detection at 1S/2S/3S thresholds
-6. **Edge cases:** Power on with no battery, no fans — verify ERROR state triggers
+
+1. **Oscilloscope:** 25 kHz PWM on PD5/PD6, duty responds to button gestures
+2. **Logic analyzer:** WS2812 T0H/T0L/T1H/T1L within datasheet spec
+3. **Visual:** Rainbow animation rotates, error fast-blinks red, speed color transitions across RPM range
+4. **Fan test:** Real fans connected via CN1 or CN4, confirm tach read-back and single/dual detection
+5. **Battery test:** Variable DC supply at BAT+, verify 1S/2S/3S thresholds, gauge LED count, critical blink
+6. **Edge cases:** Power on with no battery → ERROR; power on with battery but no fans → ERROR; hot-plug fan during RUNNING → speed LED falls to blue
