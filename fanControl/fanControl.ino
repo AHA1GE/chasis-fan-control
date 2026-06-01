@@ -123,15 +123,14 @@ static uint8_t  g_phase   = 0;       // 0=rainbow, 1=spinup, 2=count, 3=done
  * SECTION 3 — Interrupt lock helpers (RISC-V)
  * ================================================================ */
 
-// RISC-V: disable machine-mode interrupts, return previous state
+// RISC-V: disable machine-mode interrupts, return previous mstatus
 static inline uint32_t irq_lock(void) {
     uint32_t prev;
-    __asm__ volatile("csrr %0, primask" : "=r"(prev));
-    __asm__ volatile("csrc primask, 1");
+    __asm__ volatile("csrrci %0, mstatus, 8" : "=r"(prev));  // read & clear MIE (bit 3)
     return prev;
 }
 static inline void irq_restore(uint32_t prev) {
-    if (prev & 1) __asm__ volatile("csrs primask, 1");
+    if (prev & 0x8) __asm__ volatile("csrsi mstatus, 8");    // restore MIE if it was set
 }
 
 /* ================================================================
@@ -159,12 +158,10 @@ static void pwm_begin(void) {
     TIM1->ATRLR = PWM_PERIOD;
     TIM1->CNT   = 0;
 
-    // CH1 (PD5): PWM mode 1, preload
-    // CHCTLR1: OC1M[2:0]=110(PWM1), OC1PE=1
-    TIM1->CHCTLR1 = (6 << 4) | (1 << 3);
-
-    // CH2 (PD6): PWM mode 1, preload
-    TIM1->CHCTLR2 = (6 << 4) | (1 << 3);
+    // CH1 (PD5) in lower byte, CH2 (PD6) in upper byte of CHCTLR1
+    // OC1M[2:0]=110(PWM1), OC1PE=1 for each channel
+    TIM1->CHCTLR1 = ((6 << 4) | (1 << 3))         // CH1: OC1M=PWM1, OC1PE
+                  | (((6 << 4) | (1 << 3)) << 8);  // CH2: OC2M=PWM1, OC2PE
 
     // Enable outputs CC1E + CC2E
     TIM1->CCER |= (1 << 0) | (1 << 4);
