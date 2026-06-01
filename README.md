@@ -170,7 +170,9 @@ Full system test: power on → rainbow → battery gauge appears → button cont
 
 ## License
 
-[Specify your license here]
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0) — see [LICENSE](LICENSE) for the full text.
+
+SPDX-License-Identifier: AGPL-3.0-or-later
 
 ---
 
