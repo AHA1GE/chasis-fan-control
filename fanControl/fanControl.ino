@@ -65,6 +65,10 @@
 #define RAINBOW_FRAMES     40     // 40 × 50 ms = 2 s
 #define ERROR_BLINK_MS     100    // 5 Hz
 
+// ---- Display / colour ----
+#define MIN_RPM            2000   // fan minimum speed at 0% PWM; peg to blue
+#define MAX_RPM           20000   // fan maximum speed at 100% PWM / 12V; peg to red
+
 // ---- Duty cycle table (single-click) ----
 static const uint8_t dutyTable[4] = { 0, 25, 50, 75 };
 
@@ -251,21 +255,32 @@ static void colorWheel(uint8_t pos, uint8_t grb[3]) {
     }
 }
 
-// Speed palette: blue → cyan → green → yellow → red  (GRB order)
-static const uint8_t spdPal[5][3] = {
-    {  0,   0, 128},  // Blue    0–1000 RPM
-    {128,   0, 128},  // Cyan  1000–2000
-    {128,   0,   0},  // Green 2000–3000
-    {128, 128,   0},  // Yel   3000–5000
-    {  0, 128,   0},  // Red     5000+
-};
+// Linear heatmap: blue → green → red  (GRB order)
+// ≤ MIN_RPM = pure blue,  ≥ MAX_RPM = pure red
+static void rpmToHeatColor(uint16_t rpm, uint8_t grb[3]) {
+    if (rpm <= MIN_RPM) {
+        grb[0] = 0;   grb[1] = 0;   grb[2] = 255;   // pure blue
+        return;
+    }
+    if (rpm >= MAX_RPM) {
+        grb[0] = 0;   grb[1] = 255; grb[2] = 0;     // pure red
+        return;
+    }
 
-static uint8_t rpm2idx(uint16_t rpm) {
-    if (rpm < 1000) return 0;
-    if (rpm < 2000) return 1;
-    if (rpm < 3000) return 2;
-    if (rpm < 5000) return 3;
-    return 4;
+    uint16_t span   = MAX_RPM - MIN_RPM;              // 18000
+    uint16_t midpoint = (MIN_RPM + MAX_RPM) / 2;      // 11000
+
+    if (rpm < midpoint) {
+        // Blue → Green:  G rises 0→255,  B falls 255→0
+        uint32_t t = rpm - MIN_RPM;
+        uint8_t  g = (uint8_t)(t * 255 / (span / 2));
+        grb[0] = g;        grb[1] = 0;   grb[2] = 255 - g;
+    } else {
+        // Green → Red:  R rises 0→255,  G falls 255→0
+        uint32_t t = rpm - midpoint;
+        uint8_t  r = (uint8_t)(t * 255 / (span / 2));
+        grb[0] = 255 - r;  grb[1] = r;   grb[2] = 0;
+    }
 }
 
 /* ================================================================
@@ -455,29 +470,29 @@ static void dsp_update(uint32_t now) {
     g_tDsp  = now;
     g_dirty = false;
 
-    // Gauge: dim white, increasing brightness
+    // Compute RPM colour once — applies to all lit LEDs
+    uint8_t rpmColour[3];
+    rpmToHeatColor(g_rpm, rpmColour);
+
+    // Battery gauge → LED count only;  RPM → colour
     for (uint8_t i = 0; i < NUM_LEDS; i++) {
         if (i < g_gauge) {
-            uint8_t b = 24 + i * 16;
-            g_leds[i][0] = g_leds[i][1] = g_leds[i][2] = b;
+            g_leds[i][0] = rpmColour[0];
+            g_leds[i][1] = rpmColour[1];
+            g_leds[i][2] = rpmColour[2];
         } else {
-            g_leds[i][0] = g_leds[i][1] = g_leds[i][2] = 0;
+            g_leds[i][0] = 0;
+            g_leds[i][1] = 0;
+            g_leds[i][2] = 0;
         }
     }
 
-    // Overlay "upper" (highest lit) LED with speed colour
-    if (g_gauge > 0) {
-        uint8_t u = g_gauge - 1;
-        uint8_t ci = rpm2idx(g_rpm);
-        g_leds[u][0] = spdPal[ci][0];
-        g_leds[u][1] = spdPal[ci][1];
-        g_leds[u][2] = spdPal[ci][2];
-    }
-
-    // Critical battery blink: last gauge LED flashes at 2 Hz
+    // Critical battery: blink topmost gauge LED at 2 Hz (still in RPM colour)
     if (g_socPct < 10 && g_gauge == 1) {
         if ((now / 250) & 1) {
-            g_leds[0][0] = g_leds[0][1] = g_leds[0][2] = 0;
+            g_leds[0][0] = 0;
+            g_leds[0][1] = 0;
+            g_leds[0][2] = 0;
         }
     }
 
