@@ -1,3 +1,5 @@
+# [English](README.md) · [中文（简体）](README.zh-CN.md)
+
 # Chasis Fan Control
 
 Dual chassis fan controller based on the **CH32V003** RISC-V microcontroller. Drives two 4-pin PWM fans simultaneously with push-button speed selection, WS2812 battery gauge, and tachometer read-back — all powered from a 1S–3S LiPo with automatic cell-count detection.
