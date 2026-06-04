@@ -68,6 +68,8 @@
 // ---- Display / colour ----
 #define MIN_RPM            2000   // fan minimum speed at 0% PWM; peg to blue
 #define MAX_RPM           20000   // fan maximum speed at 100% PWM / 12V; peg to red
+#define RPM_HALF_SPAN      9000   // (MAX_RPM - MIN_RPM) / 2
+#define RPM_MIDPOINT      11000   // (MIN_RPM + MAX_RPM) / 2
 
 // ---- Duty cycle table (single-click) ----
 static const uint8_t dutyTable[4] = { 0, 25, 50, 75 };
@@ -94,7 +96,6 @@ static State    g_state   = S_STARTUP;
 
 // Battery
 static uint8_t  g_cells   = 0;     // 0=error, 1, 2, 3
-static uint16_t g_adcAvg  = 0;
 static uint8_t  g_socPct  = 0;     // 0–100
 static uint8_t  g_gauge   = 0;     // 0–4 LEDs lit
 static uint32_t g_tAdc    = 0;
@@ -106,8 +107,7 @@ static uint8_t  g_fanMode = 0;      // 1=single, 2=dual
 static uint32_t g_tTach    = 0;
 
 // PWM
-static uint8_t  g_dutyPct = 0;
-static uint8_t  g_dutyIdx = 0;      // 0-3=cycle, 4=100%
+static uint8_t  g_dutyIdx = 0;      // 0-3=cycle(25/50/75), 4=100%
 
 // Display
 static uint8_t  g_leds[NUM_LEDS][3];      // GRB order: [i][0]=G, [1]=R, [2]=B
@@ -127,15 +127,15 @@ static uint8_t  g_phase   = 0;       // 0=rainbow, 1=spinup, 2=count, 3=done
  * SECTION 3 — Interrupt lock helpers (RISC-V)
  * ================================================================ */
 
-// RISC-V: disable machine-mode interrupts, return previous state
+// RISC-V: disable machine-mode interrupts via mstatus.MIE, return previous state
 static inline uint32_t irq_lock(void) {
-    uint32_t prev;
-    __asm__ volatile("csrr %0, primask" : "=r"(prev));
-    __asm__ volatile("csrc primask, 1");
-    return prev;
+    uint32_t mstatus;
+    __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
+    __asm__ volatile("csrw mstatus, %0" : : "r"(mstatus & ~0x8));
+    return mstatus;
 }
 static inline void irq_restore(uint32_t prev) {
-    if (prev & 1) __asm__ volatile("csrs primask, 1");
+    __asm__ volatile("csrw mstatus, %0" : : "r"(prev));
 }
 
 /* ================================================================
@@ -267,18 +267,15 @@ static void rpmToHeatColor(uint16_t rpm, uint8_t grb[3]) {
         return;
     }
 
-    uint16_t span   = MAX_RPM - MIN_RPM;              // 18000
-    uint16_t midpoint = (MIN_RPM + MAX_RPM) / 2;      // 11000
-
-    if (rpm < midpoint) {
+    if (rpm < RPM_MIDPOINT) {
         // Blue → Green:  G rises 0→255,  B falls 255→0
         uint32_t t = rpm - MIN_RPM;
-        uint8_t  g = (uint8_t)(t * 255 / (span / 2));
+        uint8_t  g = (uint8_t)(t * 255 / RPM_HALF_SPAN);
         grb[0] = g;        grb[1] = 0;   grb[2] = 255 - g;
     } else {
         // Green → Red:  R rises 0→255,  G falls 255→0
-        uint32_t t = rpm - midpoint;
-        uint8_t  r = (uint8_t)(t * 255 / (span / 2));
+        uint32_t t = rpm - RPM_MIDPOINT;
+        uint8_t  r = (uint8_t)(t * 255 / RPM_HALF_SPAN);
         grb[0] = 255 - r;  grb[1] = r;   grb[2] = 0;
     }
 }
@@ -308,10 +305,10 @@ static void batt_sample(void) {
     static uint8_t  idx    = 0;
     buf[idx] = raw;
     idx = (idx + 1) & 3;
-    g_adcAvg = (uint16_t)(((uint32_t)buf[0] + buf[1] + buf[2] + buf[3]) >> 2);
+    uint16_t adcAvg = (uint16_t)(((uint32_t)buf[0] + buf[1] + buf[2] + buf[3]) >> 2);
 
     // Battery mV
-    uint32_t vBat  = ((uint32_t)g_adcAvg * 5000UL * 147UL) / (1024UL * 47UL);
+    uint32_t vBat  = ((uint32_t)adcAvg * 5000UL * 147UL) / (1024UL * 47UL);
     uint32_t vCell = vBat / g_cells;
 
     // SoC %
@@ -332,40 +329,15 @@ static void batt_sample(void) {
  * SECTION 8 — Tachometer ISRs + RPM
  * ================================================================ */
 
-// Fan 2 tach: PA1 → EXTI1
-extern "C" void EXTI1_IRQHandler(void) __attribute__((interrupt));
-void EXTI1_IRQHandler(void) {
-    if (EXTI->INTFR & (1 << 1)) {
-        g_tach[1]++;
-        EXTI->INTFR = (1 << 1);
-    }
-}
-
-// Fan 1 tach: PD2 → EXTI2
-extern "C" void EXTI2_IRQHandler(void) __attribute__((interrupt));
-void EXTI2_IRQHandler(void) {
-    if (EXTI->INTFR & (1 << 2)) {
-        g_tach[0]++;
-        EXTI->INTFR = (1 << 2);
-    }
-}
+// Tach ISR callbacks — called from core's EXTI7_0_IRQHandler
+static void tach1_cb(void) { g_tach[0]++; }
+static void tach2_cb(void) { g_tach[1]++; }
 
 static void tach_begin(void) {
-    RCC->APB2PCENR |= (1 << 0);            // AFIO
-
-    // EXTI source mapping:
-    // PA1 → EXTI1: AFIO->EXTICR bits 4-7 = 0000 (port A)
-    // PD2 → EXTI2: AFIO->EXTICR bits 8-11 = 0011 (port D)
-    AFIO->EXTICR &= ~((0x0FU << 4) | (0x0FU << 8));
-    AFIO->EXTICR |=  (0x3U << 8);          // EXTI2 = Port D
-
-    EXTI->RTENR  |= (1 << 1) | (1 << 2);   // rising edge
-    EXTI->INTENR |= (1 << 1) | (1 << 2);   // interrupt enable
-
-    NVIC_EnableIRQ(EXTI1_IRQn);
-    NVIC_SetPriority(EXTI1_IRQn, 1);
-    NVIC_EnableIRQ(EXTI2_IRQn);
-    NVIC_SetPriority(EXTI2_IRQn, 1);
+    // Fan 1 tach: PD2 → EXTI2, rising edge
+    attachInterrupt(TACH1_PIN, GPIO_Mode_IPU, tach1_cb, EXTI_Mode_Interrupt, EXTI_Trigger_Rising);
+    // Fan 2 tach: PA1 → EXTI1, rising edge
+    attachInterrupt(TACH2_PIN, GPIO_Mode_IPU, tach2_cb, EXTI_Mode_Interrupt, EXTI_Trigger_Rising);
 }
 
 static void tach_update(void) {
@@ -441,7 +413,6 @@ static void btn_poll(uint32_t now) {
         longDone = true;
         clicks   = 0;
         g_dutyIdx = 0;
-        g_dutyPct = dutyTable[0];
         pwm_set(0);
         g_dirty   = true;
     }
@@ -450,12 +421,11 @@ static void btn_poll(uint32_t now) {
     if (clicks && (now - tRelease) > BTN_DOUBLE_GAP_MS) {
         if (clicks == 1) {               // single: cycle
             g_dutyIdx = (g_dutyIdx + 1) % 4;
-            g_dutyPct = dutyTable[g_dutyIdx];
+            pwm_set(dutyTable[g_dutyIdx]);
         } else {                          // double: 100 %
             g_dutyIdx = 4;
-            g_dutyPct = 100;
+            pwm_set(100);
         }
-        pwm_set(g_dutyPct);
         g_dirty = true;
         clicks  = 0;
     }
