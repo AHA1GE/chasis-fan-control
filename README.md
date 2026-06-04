@@ -6,8 +6,8 @@ Dual chassis fan controller based on the **CH32V003** RISC-V microcontroller. Dr
 
 - **Dual fan PWM control** — both fans run at the same duty cycle, driven by hardware PWM from the CH32V003.
 - **Push-button speed selection** — single-click cycles through 0% → 25% → 50% → 75%; double-click jumps to 100%; long-press snaps to 0%.
-- **Tachometer feedback** — reads fan RPM from the open-drain tach signal and maps speed to color on the WS2812 LEDs (blue → cyan → green → yellow → red for low → high).
-- **Battery gauge** — 4× WS2812C LEDs show state-of-charge by count: 1 LED = 5–25%, 2 = 25–50%, 3 = 50–75%, 4 = 75–100%. The appropriate LED blinks when the battery is critically low.
+- **Tachometer feedback** — reads fan RPM from the open-drain tach signal and maps speed to a linear heatmap colour across all lit WS2812 LEDs (blue → green → red for low → high).
+- **Battery gauge** — 4× WS2812C LEDs show state-of-charge by count only: 1 LED = 5–25%, 2 = 25–50%, 3 = 50–75%, 4 = 75–100%. All lit LEDs share the RPM heatmap colour; the topmost LED blinks at 2 Hz when the battery is critically low (<10%).
 - **Auto cell-count detection** — voltage divider sampled at boot recognizes 1S (3.0–4.2 V), 2S (6.0–8.4 V), or 3S (9.0–12.6 V) LiPo packs.
 - **Physical master switch** — a slide switch fully disconnects battery ground via an N-channel MOSFET; zero quiescent draw when off.
 - **Buck-boost regulator** — TPS63070 provides a clean 5 V rail from a 2–16 V battery input; works across the full discharge range of any supported pack.
@@ -52,15 +52,15 @@ After power-up both fans start at 0% PWM (lowest speed / stopped, depending on t
 
 ### Reading Fan Speed
 
-The "up" LED color encodes the current fan RPM read from the tachometer signal:
+All lit gauge LEDs share the same RPM heatmap colour — the battery only controls how many LEDs are lit, not their colour:
 
 | Color | Meaning |
 |-------|---------|
-| 🔵 Blue | Lowest RPM |
-| 🩵 Cyan | Low |
-| 🟢 Green | Medium |
-| 🟡 Yellow | High |
-| 🔴 Red | Highest RPM |
+| 🔵 Blue | Lowest RPM (≤ 2000) |
+| 🟢 Green | Medium RPM (~11000) |
+| 🔴 Red | Highest RPM (≥ 20000) |
+
+The transition is a continuous linear blend: blue → green → red as RPM increases.
 
 ### Battery Gauge
 
@@ -81,7 +81,7 @@ Flip the slide switch to **OFF** — the MOSFET disconnects battery ground and t
 
 [`fanControl/fanControl.ino`](fanControl/fanControl.ino) — single-file firmware for the CH32V003 Arduino environment.
 
-> **⚠️ Status: freshly written, not yet tested on hardware.** The PCB has not been manufactured. The firmware compiles but has not been validated against real fans, batteries, or WS2812 LEDs. See [Testing](#testing) below.
+> **⚠️ Status: compiles successfully, not yet tested on hardware.** The PCB has not been manufactured. The firmware has been validated to compile but has not been tested against real fans, batteries, or WS2812 LEDs. See [Testing](#testing) below.
 
 ### Pin assignments
 
@@ -101,8 +101,9 @@ Flip the slide switch to **OFF** — the MOSFET disconnects battery ground and t
 
 - **Arduino-first coding style** — `pinMode`, `digitalRead`, `analogRead`, `millis`, `delayMicroseconds` for all high-level logic. Register-level code is isolated to three init helpers (`pwm_begin`, `ws2812_begin`, `tach_begin`) called once in `setup()`.
 - **No interrupt blocking** — WS2812 is driven via hardware SPI at 3 MHz. The 48-byte transfer (4 LEDs × 3 colours × 4 SPI-bytes/colour) streams through `SPI1->DATAR` without disabling interrupts. Tach ISRs fire unimpeded.
+- **RISC-V IRQ locking** — tach counter read/reset uses `mstatus.MIE` CSR manipulation (`irq_lock`/`irq_restore`) for atomic access instead of Arduino `noInterrupts()`/`interrupts()`, which may not be available on all CH32V003 cores.
 - **Button debounce** — polled every ~1 ms in `loop()`, 30-sample debounce counter. Edge detection with falling/rising transitions, single-click/double-click/long-press resolved by gap timeout.
-- **Tach** — `EXTI1_IRQHandler` (PA1) and `EXTI2_IRQHandler` (PD2) increment atomic pulse counters. Every 2 seconds the main loop snapshots and resets them, computing RPM = pulses × 15.
+- **Tach** — `attachInterrupt` on PD2 and PA1 (EXTI2/EXTI1) increment atomic pulse counters. Every 2 seconds the main loop snapshots and resets them, computing RPM = pulses × 15.
 - **Startup sequence** — 2 s rainbow animation → battery cell-count detection (4-sample averaged ADC) → spin fans at 100% for 500 ms → count tach pulses for 1 s → enter RUNNING or ERROR.
 
 ### Display behaviour
@@ -111,9 +112,8 @@ Flip the slide switch to **OFF** — the MOSFET disconnects battery ground and t
 |-------------|---------|
 | 4× rainbow rotating (2 s) | Power-on startup |
 | All 4 LEDs fast-blink red (5 Hz) | Error: bad battery voltage OR no fans detected |
-| 1–4 LEDs dim white | Battery gauge: 1=5–25%, 2=25–50%, 3=50–75%, 4=75–100% |
-| Top LED colour: blue → cyan → green → yellow → red | Fan RPM low → high |
-| Top LED blinking off/on | Battery critically low (<10%) |
+| 1–4 LEDs lit, colour = blue → green → red | Gauge: LED count = battery SoC; colour = fan RPM heatmap (all lit LEDs share the same colour) |
+| Topmost gauge LED blinking off/on (2 Hz) | Battery critically low (<10%); blinks in the current RPM colour |
 
 ## Pin Reference
 
@@ -131,7 +131,7 @@ The firmware is untested. When the board arrives, verify in this order:
 Probe PD5 and PD6. Confirm 25 kHz, 0% duty at idle. Change duty via button and verify CCR matches `{0, 480, 960, 1440, 1919}` for `{0%, 25%, 50%, 75%, 100%}`.
 
 ### 2. WS2812 (logic analyser)
-Probe PC6 (SPI1_MOSI). Verify 3 MHz clock, correct SPI byte stream (`0x88`/`0x8E`/`0xE8`/`0xEE` patterns), 48 bytes per frame, ≥50 µs reset gap. Visually confirm rainbow animation and solid colours.
+Probe PC6 (SPI1_MOSI). Verify 3 MHz clock, correct SPI byte stream (`0x88`/`0x8E`/`0xE8`/`0xEE` patterns), 48 bytes per frame, ≥50 µs reset gap. Visually confirm rainbow animation, uniform RPM heatmap colour across all lit LEDs (blue → green → red), and correct LED count per battery SoC.
 
 ### 3. Battery ADC (variable DC supply)
 Apply known voltages to BAT+ and read `analogRead(PA2)`. Verify:
@@ -150,12 +150,12 @@ Test each gesture:
 - Long press (hold >1 s) → duty snaps to 0% immediately
 
 ### 6. End-to-end
-Full system test: power on → rainbow → battery gauge appears → button controls fan speed → speed colour tracks RPM → low battery triggers blink → power off.
+Full system test: power on → rainbow → battery gauge appears (LED count = SoC, colour = RPM heatmap) → button controls fan speed → speed colour tracks RPM on all lit LEDs → low battery triggers 2 Hz blink on topmost LED → power off.
 
 ### Edge cases
 - Power on with no battery → ERROR
 - Power on with battery but no fans connected → ERROR
-- Hot-plug fan during RUNNING → speed LED falls to blue (0 RPM)
+- Hot-plug fan during RUNNING → all lit LEDs fall to blue (0 RPM)
 - Power on at borderline ADC values (near 1S/2S boundary) → correct cell count
 
 ## Build & Flash
@@ -177,6 +177,6 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 ---
 
 *Schematic and PCB designed with EasyEDA Pro. MCU: WCH CH32V003F4P6 (QingKe V2 RISC-V).*
-*Firmware written June 2026 — awaiting hardware validation.*
+*Firmware written May–June 2026 — compiles successfully, awaiting hardware validation.*
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
