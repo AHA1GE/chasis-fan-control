@@ -66,10 +66,10 @@
 #define ERROR_BLINK_MS     100    // 5 Hz
 
 // ---- Display / colour ----
-#define MIN_RPM            2000   // fan minimum speed at 0% PWM; peg to blue
+#define MIN_RPM           100     // fan minimum speed at 0% PWM; peg to blue
 #define MAX_RPM           20000   // fan maximum speed at 100% PWM / 12V; peg to red
-#define RPM_HALF_SPAN      9000   // (MAX_RPM - MIN_RPM) / 2
-#define RPM_MIDPOINT      11000   // (MIN_RPM + MAX_RPM) / 2
+#define RPM_HALF_SPAN     ((MAX_RPM - MIN_RPM) / 2)   
+#define RPM_MIDPOINT      ((MIN_RPM + MAX_RPM) / 2)   
 
 // ---- Duty cycle table (single-click) ----
 static const uint8_t dutyTable[4] = { 0, 25, 50, 75 };
@@ -520,9 +520,12 @@ static void run_startup(uint32_t now) {
             else if (c1 > 3)           g_fanMode = 1;
             else                       g_fanMode = 0;
 
-            if (g_cells == 0 || g_fanMode == 0) {
-                g_state = S_ERROR;
-            } else {
+            // if (g_cells == 0 || g_fanMode == 0) 
+            // {
+            //     g_state = S_ERROR;
+            // } 
+            // else 
+            {
                 g_state = S_RUNNING;
                 g_dirty = true;
             }
