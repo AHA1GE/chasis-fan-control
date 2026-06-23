@@ -30,7 +30,7 @@
 // Duty table (single-click cycle)
 static const int dutyTable[4] = {25, 50, 75, 100};
 
-// ---- WS2812 via mcycle bitbang on PD4 ----
+// ---- WS2812 ----
 #define LED_PIN PD4
 // Duty colours in GRB order: [G, R, B]
 static const int dutyColors[4][3] = {
