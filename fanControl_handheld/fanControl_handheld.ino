@@ -30,8 +30,13 @@
 // Duty table (single-click cycle)
 static const int dutyTable[4] = {25, 50, 75, 100};
 
-// ---- WS2812 ----
-#define LED_PIN PD4
+// ---- WS2812 via TIM2_CH4 PWM+DMA on PD5 (T2CH4_3) ----
+#define NUM_LEDS          1
+#define WS2812_T0H        19     // ~0.4 µs at 800 kHz
+#define WS2812_T1H        38     // ~0.8 µs at 800 kHz
+#define WS2812_RESET_LEN  50     // >50 µs reset = 62.5 µs
+#define WS2812_BUF_SIZE   (NUM_LEDS * 24 + WS2812_RESET_LEN)  // 74
+
 // Duty colours in GRB order: [G, R, B]
 static const int dutyColors[4][3] = {
     {128, 0, 128}, // 25%  = CYAN
@@ -95,6 +100,9 @@ static int g_led_R = 0;
 static int g_led_B = 0;
 static bool g_led_dirty = false;
 static long g_led_t_last_millis = 0;
+
+// DMA buffer for WS2812 PWM+DMA (one half-word per bit + reset)
+static uint16_t g_ws2812_dma_buf[WS2812_BUF_SIZE];
 
 // S_WAIT timer (10 s countdown when g_prevState == S_ON)
 static unsigned long g_tWait = 0;
@@ -191,6 +199,76 @@ static void fan_off(void)
 {
     digitalWrite(FAN_PWM_PIN, LOW);
     digitalWrite(FAN_EN_PIN, LOW);
+}
+
+/* ================================================================
+ * WS2812 PWM+DMA driver (TIM2_CH4 on PD5, 800 kHz carrier)
+ * ================================================================ */
+
+static void ws2812_begin(void)
+{
+    // ---- Clocks ----
+    RCC->APB2PCENR |= (1 << 5)   // GPIOD
+                   |  (1 << 0);  // AFIO
+    RCC->APB1PCENR |= (1 << 0);  // TIM2
+    RCC->AHBPCENR  |= (1 << 0);  // DMA1
+
+    // ---- AFIO: TIM2 Full Remap (TIM2_RM[1:0] = 11 → CH4 on PD5) ----
+    AFIO->PCFR1 = (AFIO->PCFR1 & ~(3UL << 8)) | (3UL << 8);
+
+    // ---- PD5 → alternate push-pull, 50 MHz (nibble 5, bits 23:20) ----
+    GPIOD->CFGLR = (GPIOD->CFGLR & ~(0xFUL << 20)) | (0xBUL << 20);
+
+    // ---- TIM2: PSC=0, ARR=59 → 48 MHz / 60 = 800 kHz ----
+    TIM2->PSC   = 0;
+    TIM2->ATRLR = 59;
+    TIM2->CNT   = 0;
+
+    // ---- CH4: PWM mode 1 with preload ----
+    // CHCTLR2 bits 15:12 control CH4: OC4M[2:0]=110(PWM1), OC4PE=1
+    TIM2->CHCTLR2 = (6UL << 12) | (1UL << 11);
+
+    // ---- CH4 output enable (CC4E) ----
+    TIM2->CCER |= (1UL << 12);
+
+    // ---- DMA request on update (UDE) ----
+    TIM2->DMAINTENR |= TIM_UDE;
+
+    // ---- DMA1 Channel 5: Memory→TIM2_CH4CVR, 16-bit, normal mode ----
+    DMA1_Channel5->PADDR = (uint32_t)&TIM2->CH4CVR;
+    DMA1_Channel5->MADDR = (uint32_t)g_ws2812_dma_buf;
+    // CFGR: DIR=M2P(bit4), MINC(bit7), PSIZE=16b(bit8), MSIZE=16b(bit10), PL=High(bits13:12=10)
+    DMA1_Channel5->CFGR  = (1UL << 4) | (1UL << 7) | (1UL << 8) | (1UL << 10) | (2UL << 12);
+}
+
+static void ws2812_send(uint8_t g, uint8_t r, uint8_t b)
+{
+    // Fill DMA buffer: 24 bits GRB MSB-first + 50 reset slots
+    uint32_t packed = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
+    uint16_t pos = 0;
+    for (uint8_t i = 0; i < 24; i++) {
+        g_ws2812_dma_buf[pos++] = (packed & 0x800000UL) ? WS2812_T1H : WS2812_T0H;
+        packed <<= 1;
+    }
+    for (uint8_t i = 0; i < WS2812_RESET_LEN; i++) {
+        g_ws2812_dma_buf[pos++] = 0;
+    }
+
+    // Re-arm DMA
+    DMA1_Channel5->CFGR &= ~(1UL << 0);          // CHEN = 0
+    DMA1_Channel5->CNTR  = WS2812_BUF_SIZE;      // transfer count
+    DMA1_Channel5->MADDR = (uint32_t)g_ws2812_dma_buf;  // reset memory ptr
+    DMA1_Channel5->CFGR |= (1UL << 0);           // CHEN = 1
+
+    // Start timer
+    TIM2->CTLR1 |= (1UL << 0);                   // CEN
+
+    // Poll transfer-complete (TC5 = INTFR bit 17)
+    while (!(DMA1->INTFR & (1UL << 17)));
+    DMA1->INTFCR = (1UL << 17);                  // clear TC5
+
+    // Stop timer
+    TIM2->CTLR1 &= ~(1UL << 0);                  // CEN = 0
 }
 
 /* ================================================================
@@ -361,10 +439,8 @@ static void led_task(unsigned long nowMillis)
             g_led_R = 0;
             g_led_B = 0;
         }
-        return;
     }
-
-    switch (g_state)
+    else switch (g_state)
     {
 
     case S_WAIT:
@@ -408,6 +484,9 @@ static void led_task(unsigned long nowMillis)
         break;
     }
     }
+
+    // Push to WS2812 via PWM+DMA
+    // ws2812_send((uint8_t)g_led_G, (uint8_t)g_led_R, (uint8_t)g_led_B);
 }
 
 /* ================================================================
@@ -479,6 +558,9 @@ void setup(void)
     // CHARGE_PIN EXTI for instant charge detection (falling edge = plug-in)
     attachInterrupt(CHARGE_PIN, GPIO_Mode_IPU, charge_isr,
                     EXTI_Mode_Interrupt, EXTI_Trigger_Falling);
+
+    // WS2812 PWM+DMA driver init (TIM2_CH4 on PD5)
+    // ws2812_begin();
 
     // Initial state: check if charger is plugged in at boot
     g_prevState = S_WAIT; // signals: no auto-sleep timer
