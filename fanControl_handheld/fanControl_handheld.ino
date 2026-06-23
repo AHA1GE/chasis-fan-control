@@ -140,33 +140,41 @@ static void deep_sleep_enter(void)
     RCC->APB2PCENR |= (1 << 0); // AFIO
 
     // PD6 → EXTI6: falling edge trigger (button press)
+    // EXTI lines 4-7 on CH32V003 are fixed-port — EXTI6 fires on
+    // PD6 (pin 6 of GPIOD).  No AFIO->EXTICR configuration needed.
     EXTI->FTENR |= (1 << 6);
     EXTI->INTENR |= (1 << 6);
     EXTI->INTFR = (1 << 6); // write 1 to clear any pending EXTI6
 
     // PC1 → EXTI1: falling edge trigger (charger plug-in)
+    // EXTI1 routing to PC1 was already set up by attachInterrupt() in setup(),
+    // but re-apply here in case standby-gate reset clears it.
     EXTI->FTENR |= (1 << 1);
     EXTI->INTENR |= (1 << 1);
     EXTI->INTFR = (1 << 1); // write 1 to clear any pending EXTI1
 
-    // Enter STANDBY: SLEEPDEEP=1, PDDS=1
-    // PWR->CTLR: bit 2 = SLEEPDEEP, bit 1 = PDDS
+    // Enter STANDBY: SLEEPDEEP=1 (in PFIC SCTLR), PDDS=1 (in PWR->CTLR)
     RCC->APB1PCENR |= (1 << 28); // PWR clock enable
-    PWR->CTLR |= (1 << 2);       // SLEEPDEEP
-    PWR->CTLR |= (1 << 1);       // PDDS = STANDBY (not STOP)
 
-    // Disable all interrupts to prevent spurious wake
-    __asm__ volatile("csrw mie, %0"
-                     :
-                     : "r"(0));
+    PWR->CTLR &= ~(1UL << 0);    // Clear LPDS  — ensure correct standby mode
+    PWR->CTLR |= (1UL << 1);     // Set   PDDS  — Power-Down Deepsleep = Standby
 
-    // Execute WFI
+    // CRITICAL: SLEEPDEEP is in the PFIC System Control Register (NVIC->SCTLR
+    // bit 2), NOT in PWR->CTLR.  The original code wrote to PWR->CTLR bit 2
+    // which is CWUF (Clear Wakeup Flag) — a no-op for standby entry.
+    NVIC->SCTLR |= (1 << 2);     // SLEEPDEEP = 1
+
+    // Execute WFI to enter standby.
+    // Do NOT disable interrupts (csrw mie,0) — in Standby mode the EXTI
+    // line hardware directly wakes the voltage regulator; CPU interrupt
+    // delivery is irrelevant.  Disabling interrupts before WFI in Sleep
+    // mode makes WFI a NOP (returns immediately).
     __asm__ volatile("wfi");
 
-    // Should never reach here — STANDBY wake triggers POR reset
-    while (1)
-    { /* wait for reset */
-    }
+    // Should never reach here — STANDBY wake triggers a full POR-like reset.
+    // If we do reach here (standby entry failed), force a system reset so
+    // the device doesn't appear dead.
+    NVIC_SystemReset();
 }
 
 // Triangle wave: 0→255→0 over period_ms.  Returns current brightness 0–255.
@@ -224,9 +232,10 @@ static void ws2812_begin(void)
     TIM2->ATRLR = 59;
     TIM2->CNT   = 0;
 
-    // ---- CH4: PWM mode 1 with preload ----
-    // CHCTLR2 bits 15:12 control CH4: OC4M[2:0]=110(PWM1), OC4PE=1
-    TIM2->CHCTLR2 = (6UL << 12) | (1UL << 11);
+    // ---- CH4: PWM mode 1, no preload (OC4PE=0) for direct DMA updates ----
+    // Preload off avoids the "first DMA value used for 3 periods" issue.
+    // CHCTLR2 bits 15:12 control CH4: OC4M[2:0]=110(PWM1), OC4PE=0
+    TIM2->CHCTLR2 = (6UL << 12);
 
     // ---- CH4 output enable (CC4E) ----
     TIM2->CCER |= (1UL << 12);
@@ -234,11 +243,13 @@ static void ws2812_begin(void)
     // ---- DMA request on update (UDE) ----
     TIM2->DMAINTENR |= TIM_UDE;
 
-    // ---- DMA1 Channel 5: Memory→TIM2_CH4CVR, 16-bit, normal mode ----
-    DMA1_Channel5->PADDR = (uint32_t)&TIM2->CH4CVR;
-    DMA1_Channel5->MADDR = (uint32_t)g_ws2812_dma_buf;
+    // ---- DMA1 Channel 2: TIM2_UP → Memory→TIM2_CH4CVR, 16-bit, normal mode ----
+    // CH32V003 RM Table 8-2: TIM2_UP request is hardwired to DMA1 Channel 2.
+    // (Channel 5, which was used previously, only serves TIM1_CH3/CH4/USART1_TX.)
+    DMA1_Channel2->PADDR = (uint32_t)&TIM2->CH4CVR;
+    DMA1_Channel2->MADDR = (uint32_t)g_ws2812_dma_buf;
     // CFGR: DIR=M2P(bit4), MINC(bit7), PSIZE=16b(bit8), MSIZE=16b(bit10), PL=High(bits13:12=10)
-    DMA1_Channel5->CFGR  = (1UL << 4) | (1UL << 7) | (1UL << 8) | (1UL << 10) | (2UL << 12);
+    DMA1_Channel2->CFGR  = (1UL << 4) | (1UL << 7) | (1UL << 8) | (1UL << 10) | (2UL << 12);
 }
 
 static void ws2812_send(uint8_t g, uint8_t r, uint8_t b)
@@ -254,18 +265,23 @@ static void ws2812_send(uint8_t g, uint8_t r, uint8_t b)
         g_ws2812_dma_buf[pos++] = 0;
     }
 
-    // Re-arm DMA
-    DMA1_Channel5->CFGR &= ~(1UL << 0);          // CHEN = 0
-    DMA1_Channel5->CNTR  = WS2812_BUF_SIZE;      // transfer count
-    DMA1_Channel5->MADDR = (uint32_t)g_ws2812_dma_buf;  // reset memory ptr
-    DMA1_Channel5->CFGR |= (1UL << 0);           // CHEN = 1
+    // Preload the first buffer value into CH4CVR so the first PWM period
+    // uses the correct duty (with OC4PE=0 this writes directly to the active
+    // compare register — no preload shadow to worry about).
+    TIM2->CH4CVR = g_ws2812_dma_buf[0];
 
-    // Start timer
+    // Re-arm DMA (Channel 2 — TIM2_UP request destination)
+    DMA1_Channel2->CFGR &= ~(1UL << 0);          // CHEN = 0
+    DMA1_Channel2->CNTR  = WS2812_BUF_SIZE;      // transfer count
+    DMA1_Channel2->MADDR = (uint32_t)g_ws2812_dma_buf;  // reset memory ptr
+    DMA1_Channel2->CFGR |= (1UL << 0);           // CHEN = 1
+
+    // Start timer (was stopped after previous transmission)
     TIM2->CTLR1 |= (1UL << 0);                   // CEN
 
-    // Poll transfer-complete (TC5 = INTFR bit 17)
-    while (!(DMA1->INTFR & (1UL << 17)));
-    DMA1->INTFCR = (1UL << 17);                  // clear TC5
+    // Poll transfer-complete (TC2 = INTFR bit 5 for Channel 2)
+    while (!(DMA1->INTFR & (1UL << 5)));
+    DMA1->INTFCR = (1UL << 5);                   // clear TC2
 
     // Stop timer
     TIM2->CTLR1 &= ~(1UL << 0);                  // CEN = 0
@@ -486,7 +502,7 @@ static void led_task(unsigned long nowMillis)
     }
 
     // Push to WS2812 via PWM+DMA
-    // ws2812_send((uint8_t)g_led_G, (uint8_t)g_led_R, (uint8_t)g_led_B);
+    ws2812_send((uint8_t)g_led_G, (uint8_t)g_led_R, (uint8_t)g_led_B);
 }
 
 /* ================================================================
@@ -546,6 +562,15 @@ static void charge_isr(void)
 
 void setup(void)
 {
+    // ---- STANDBY-wake detection ----
+    // After waking from Standby the MCU executes a full POR-like reset.
+    // RCC->RSTSCKR flags tell us WHY we reset.
+    //   Bit 31 (LPWRRSTF): low-power / standby reset
+    //   Bit 27 (PORRSTF):  cold power-on reset
+    //   Bit 26 (PINRSTF):  NRST pin reset
+    // Clear all reset flags so the next reset cause can be read cleanly
+    RCC->RSTSCKR |= (1UL << 24); // RMVF bit — clears all reset flags
+
     // GPIO init (Arduino API)
     pinMode(FAN_EN_PIN, OUTPUT);
     pinMode(FAN_PWM_PIN, OUTPUT);
@@ -556,24 +581,33 @@ void setup(void)
     pinMode(CHARGE_PIN, INPUT_PULLUP); // charge detect: active-low, pull-up
 
     // CHARGE_PIN EXTI for instant charge detection (falling edge = plug-in)
+    // This also routes PC1 → EXTI1 via AFIO->EXTICR, which is required for
+    // Standby wake via charger plug-in.
     attachInterrupt(CHARGE_PIN, GPIO_Mode_IPU, charge_isr,
                     EXTI_Mode_Interrupt, EXTI_Trigger_Falling);
 
-    // WS2812 PWM+DMA driver init (TIM2_CH4 on PD5)
-    // ws2812_begin();
+    // WS2812 PWM+DMA driver init (TIM2_CH4 on PD5 via TIM2 Full Remap)
+    ws2812_begin();
 
     // Initial state: check if charger is plugged in at boot
     g_prevState = S_WAIT; // signals: no auto-sleep timer
     g_batt_tAdc = 0;
 
+    // If we woke from standby AND the charger is not plugged in, it was a
+    // button-press wake.  Enter S_WAIT (blue breath) so the user sees the
+    // device is alive.
     if (digitalRead(CHARGE_PIN) == LOW)
     {
-        // Woke from STANDBY by charger plug-in, or powered on while charging
+        // Charger plugged in — either woke from standby by charger, or
+        // powered on while charging
         fan_off();
         g_state = S_CHARGING;
     }
     else
     {
+        // No charger present.  If this was a standby wake, the button
+        // caused it — start in S_WAIT (idle).  Cold power-on also starts
+        // in S_WAIT, so the user experience is identical.
         g_state = S_WAIT;
     }
 }
