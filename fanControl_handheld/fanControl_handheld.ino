@@ -2,11 +2,15 @@
  * Chasis Fan Control — Handheld single-fan controller with WS2812 battery gauge.
  *
  * MCU:  CH32V003J4M6 @ 48 MHz (TSSOP-8)
- * Fan:  1× 4-pin PWM at 25 kHz via PC4 (Arduino analogWrite), No tachometer
- * LED:  1× WS2812C via PD4 (bitbang)
+ * Fan:  1× 4-pin PWM on PC4 (TIM1_CH4), No tachometer
+ * LED:  1× WS2812C on PD4 — timer-overflow ISR bitbang (TIM1 counter as timing reference)
  * Batt: 1S 21700 LiPo on PA2 (10k / 10k divider, 2.8 V internal ADC ref)
  * Btn:  Single button on PD6, active low, with EXTI (wake from deep sleep)
  * Chg:  Charge detect on PC1, active low, EXTI for instant detection + STANDBY wake
+ *
+ * WS2812 technique: TIM1 at 800 kHz overflow interrupt. ISR drives PD4 via BSHR,
+ * polling TIM1->CNT for pulse-width timing. Zero NOPs — all timing referenced to
+ * the hardware counter, immune to pipeline depth / compiler optimisation / cache.
  *
  * UX:
  *       - Power on(POR) or exit deep sleep: pure blue breath brightness 1 Hz
@@ -25,12 +29,20 @@
  * SECTION 1 — Constants
  * ================================================================ */
 
-// ---- Fan PWM (Arduino analogWrite) ----
+// ---- Fan PWM (TIM1_CH4 on PC4, 800 kHz base, period = 59) ----
 #define FAN_EN_PIN    PC2         // active high MOSFET gate
-#define FAN_PWM_PIN   PC4         // PWM output
+#define FAN_PWM_PIN   PC4         // TIM1_CH4;  0 %=0,  25 %=15,  50 %=30,  75 %=45,  100 %=59
 
-// ---- WS2812 via bitbang ----
-#define LED_PIN       PD4
+// ---- WS2812 via TIM1 overflow ISR ----
+#define LED_PIN       PD4         // bit-banged in ISR via GPIOD->BSHR
+#define WS2812_BITS   24
+#define WS2812_RESET  50          // 50 × 1.25 µs = 62.5 µs reset
+#define WS2812_SLOTS  (WS2812_BITS + WS2812_RESET)  // 74 slots total
+
+// TIM1 counter targets for WS2812 pulse widths (48 MHz ticks = 20.833 ns each)
+// Account for ~6 cycle ISR overhead from overflow to first GPIO write.
+#define WS_T0H_CNT    15          // target CNT for end of 0-bit high (~0.31 µs)
+#define WS_T1H_CNT    33          // target CNT for end of 1-bit high (~0.69 µs)
 
 // ---- Display / colour ----
 // Duty colours in GRB order: [G, R, B]
@@ -72,14 +84,6 @@ static const uint8_t dutyColors[4][3] = {
 // ---- Duty table (single-click cycle) ----
 static const uint8_t dutyTable[4] = { 0, 25, 50, 75 };
 
-// ---- WS2812 bitbang tuning (48 MHz, calibrate with scope) ----
-// These NOP counts are approximate — verify waveform on real hardware
-#define WS_T0H_NOP  14
-#define WS_T0L_NOP  39
-#define WS_T1H_NOP  33
-#define WS_T1L_NOP  20
-#define WS_RESET_US  60
-
 /* ================================================================
  * SECTION 2 — Global State
  * ================================================================ */
@@ -89,19 +93,19 @@ enum State : uint8_t {
     S_ON       = 1,
     S_CHARGING = 2,
 };
-static State    g_state      = S_WAIT;
-static State    g_prevState  = S_WAIT;   // in S_WAIT: if==S_ON → 10s auto-sleep timer active
-static State    g_chgPrevState = S_WAIT;  // state to restore after charger unplug
+static State    g_state         = S_WAIT;
+static State    g_prevState     = S_WAIT;   // in S_WAIT: if==S_ON → 10s auto-sleep timer active
+static State    g_chgPrevState  = S_WAIT;   // state to restore after charger unplug
 
 // Battery
 static uint8_t  g_socPct     = 0;        // 0–100
 static uint32_t g_tAdc       = 0;
 
 // PWM
-static uint8_t  g_dutyIdx     = 0;       // 0–3 = cycle (0/25/50/75), 4 = 100 %
+static uint8_t  g_dutyIdx    = 0;        // 0–3 = cycle (0/25/50/75), 4 = 100 %
 
-// Display
-static uint8_t  g_ledG       = 0;        // single LED (GRB order)
+// Display — single LED colour (GRB order)
+static uint8_t  g_ledG       = 0;
 static uint8_t  g_ledR       = 0;
 static uint8_t  g_ledB       = 0;
 static uint32_t g_tDsp       = 0;
@@ -112,102 +116,141 @@ static uint32_t g_tWait      = 0;
 // Charge detection
 static volatile bool g_chargeFlag = false;
 
-/* ================================================================
- * SECTION 3 — Interrupt lock helpers (RISC-V)
- * ================================================================ */
-
-static inline uint32_t irq_lock(void) {
-    uint32_t mstatus;
-    __asm__ volatile("csrr %0, mstatus" : "=r"(mstatus));
-    __asm__ volatile("csrw mstatus, %0" : : "r"(mstatus & ~0x8));
-    return mstatus;
-}
-static inline void irq_restore(uint32_t prev) {
-    __asm__ volatile("csrw mstatus, %0" : : "r"(prev));
-}
+// ---- WS2812 ISR state (driven by TIM1 overflow) ----
+static volatile uint8_t  g_wsSlot;        // 0 .. WS2812_SLOTS-1
+static volatile uint32_t g_wsPacked;      // current 24-bit GRB value (MSB = next bit)
+static volatile bool     g_wsBusy;        // true while transmission in progress
 
 /* ================================================================
- * SECTION 4 — Fan PWM (Arduino analogWrite)
+ * SECTION 3 — TIM1 init (shared: ISR-WS2812 on PD4 + fan PWM on PC4)
  * ================================================================ */
 
-// Convert duty percentage (0–100) to analogWrite value (0–255)
+static void tim1_begin(void) {
+    // Clock enables
+    RCC->APB2PCENR |= (1 << 4)    // GPIOC
+                   |  (1 << 5)    // GPIOD
+                   |  (1 << 11)   // TIM1
+                   |  (1 << 0);   // AFIO
+
+    // PD4 → push-pull output, 50 MHz (manually toggled in ISR)
+    uint32_t cfglr_d = GPIOD->CFGLR;
+    cfglr_d &= ~(0xFU << 16);
+    cfglr_d |=  (0x3U << 16);       // CNF=00(GP-PP), MODE=11(50 MHz)
+    GPIOD->CFGLR = cfglr_d;
+    GPIOD->BSHR = (1 << (16 + 4));  // start LOW
+
+    // PC4 → alternate push-pull 50 MHz (TIM1_CH4 for fan PWM)
+    uint32_t cfglr_c = GPIOC->CFGLR;
+    cfglr_c &= ~(0xFU << 16);
+    cfglr_c |=  (0xBU << 16);       // CNF=10(AF-PP), MODE=11(50 MHz)
+    GPIOC->CFGLR = cfglr_c;
+
+    // TIM1 timebase: 48 MHz / 1 / 60 = 800 kHz, 1.25 µs per slot
+    TIM1->PSC   = 0;
+    TIM1->ATRLR = 59;               // period = 60 ticks
+    TIM1->CNT   = 0;
+
+    // TIM1_CH4 (PC4): PWM mode 1, preload enabled, for fan
+    TIM1->CHCTLR2 = (6 << 8)        // OC4M=110 (PWM mode 1)
+                  | (1 << 11);      // OC4PE (preload enable)
+    TIM1->CCER |= (1 << 12);        // CC4E
+    TIM1->CH4CVR = 0;
+
+    // MOE + ARPE
+    TIM1->BDTR  |= (1 << 15);       // MOE
+    TIM1->CTLR1 |= (1 << 7);        // ARPE
+
+    // Enable TIM1 overflow interrupt
+    TIM1->DMAINTENR |= (1 << 0);    // UIE (Update interrupt enable)
+    NVIC_EnableIRQ(TIM1_UP_IRQn);   // enable in NVIC
+}
+
+/* ================================================================
+ * SECTION 4 — Fan PWM (TIM1_CH4, shared 800 kHz timer)
+ * ================================================================ */
+
+// TIM1 period = 59 → duty range 0–59 (60 steps).
 static inline void fan_pwm_write(uint8_t pct) {
-    uint16_t val;
-    if (pct >= 100)     val = 255;
-    else if (pct == 0)  val = 0;
-    else                val = ((uint16_t)pct * 255) / 100;
-    analogWrite(FAN_PWM_PIN, (uint8_t)val);
+    uint8_t ccr;
+    if (pct >= 100)     ccr = 59;
+    else if (pct == 0)  ccr = 0;
+    else                ccr = (uint8_t)(((uint16_t)pct * 59) / 100);
+    TIM1->CH4CVR = ccr;
+
+    // Ensure timer is running
+    if (!(TIM1->CTLR1 & 1)) {
+        TIM1->CTLR1 |= (1 << 0);          // CEN = 1
+    }
 }
 
 /* ================================================================
- * SECTION 5 — WS2812 bitbang on PD4
+ * SECTION 5 — WS2812 send (kick off ISR-driven transmission)
  * ================================================================ */
 
-static void ws2812_begin(void) {
-    // PD4 → push-pull output, 50 MHz
-    // GPIOD CFGLR nibble 4 (bits 16–19)
-    uint32_t cfglr = GPIOD->CFGLR;
-    cfglr &= ~(0xFU << 16);
-    cfglr |=  (0x3U << 16);       // CNF=00(GP-PP), MODE=11(50 MHz)
-    GPIOD->CFGLR = cfglr;
-    GPIOD->BSHR = (1 << (16 + 4)); // start LOW
+static void ws2812_send_grb(uint8_t g, uint8_t r, uint8_t b) {
+    // Pack GRB: G sent first (WS2812C order), MSB-first per byte
+    uint32_t packed = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
+
+    // Load ISR state
+    g_wsPacked = packed;
+    g_wsSlot   = 0;
+    g_wsBusy   = true;
+
+    // Start timer (ISR fires on first overflow → ~1.25 µs)
+    TIM1->CNT = 0;
+    TIM1->CTLR1 |= (1 << 0);              // CEN = 1
+
+    // Wait for transmission to complete
+    while (g_wsBusy) { /* spin */ }
 }
 
-// Send 24-bit GRB value to single WS2812 (interrupts disabled during ~30 µs)
-static void ws2812_send_grb(uint8_t g, uint8_t r, uint8_t b) {
-    uint8_t bytes[3] = {g, r, b};  // GRB order (WS2812C)
+/* ================================================================
+ * SECTION 6 — TIM1 overflow ISR (WS2812 bitbang on PD4)
+ * ================================================================ */
 
-    uint32_t prev = irq_lock();
+extern "C" void TIM1_UP_IRQHandler(void) {
+    // Clear update interrupt flag
+    TIM1->INTFR &= ~(1 << 0);            // UIF = 0
 
-    for (uint8_t i = 0; i < 3; i++) {
-        uint8_t v = bytes[i];
-        for (int8_t bit = 7; bit >= 0; bit--) {
-            if (v & (1 << bit)) {
-                // Bit = 1: long HIGH, short LOW
-                GPIOD->BSHR = (1 << 4);          // SET
-                __asm__ volatile(
-                    "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
-                    "nop"
-                );
-                GPIOD->BSHR = (1 << (16 + 4));    // CLEAR
-                __asm__ volatile(
-                    "nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop"
-                );
-            } else {
-                // Bit = 0: short HIGH, long LOW
-                GPIOD->BSHR = (1 << 4);          // SET
-                __asm__ volatile(
-                    "nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop"
-                );
-                GPIOD->BSHR = (1 << (16 + 4));    // CLEAR
-                __asm__ volatile(
-                    "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n nop\n nop\n nop\n"
-                    "nop\n nop\n nop\n nop\n nop\n nop\n nop"
-                );
-            }
-        }
+    uint8_t slot = g_wsSlot;
+
+    if (slot < WS2812_BITS) {
+        // --- Data bit ---
+        bool bitVal = (g_wsPacked & 0x800000) != 0;
+        g_wsPacked <<= 1;
+
+        // Set PD4 HIGH
+        GPIOD->BSHR = (1 << 4);
+
+        // Wait for target CNT (hardware counter, immune to pipeline/compiler/cache)
+        uint16_t target = bitVal ? WS_T1H_CNT : WS_T0H_CNT;
+        while (TIM1->CNT < target) { /* spin on hardware counter */ }
+
+        // Set PD4 LOW — rests for remainder of bit period
+        GPIOD->BSHR = (1 << (16 + 4));
+
+        // Wait for next overflow (CNT wraps to 0)
+        while (TIM1->CNT >= target) { /* spin — CNT still in this period */ }
+
+    } else if (slot < WS2812_SLOTS) {
+        // --- Reset slot — PD4 stays LOW ---
+        // Just wait for this overflow to complete
+        while (TIM1->CNT > 0)   { /* spin */ }
+        while (TIM1->CNT == 0)  { /* ensure we see the wrap */ }
+
+    } else {
+        // --- Transmission complete ---
+        TIM1->CTLR1 &= ~(1 << 0);         // CEN = 0 (stop timer)
+        GPIOD->BSHR = (1 << (16 + 4));    // PD4 LOW
+        g_wsBusy = false;
+        return;
     }
 
-    // RESET: hold LOW >50 µs
-    GPIOD->BSHR = (1 << (16 + 4));
-    delayMicroseconds(WS_RESET_US);
-
-    irq_restore(prev);
+    g_wsSlot = slot + 1;
 }
 
 /* ================================================================
- * SECTION 6 — Colour helpers
+ * SECTION 7 — Colour helpers
  * ================================================================ */
 
 // Triangle wave: 0→255→0 over period_ms.  Returns current brightness 0–255.
@@ -228,19 +271,8 @@ static void soc_to_color(uint8_t socPct, uint8_t *g, uint8_t *r, uint8_t *b) {
     *b = 0;
 }
 
-// Linear interpolation between two GRB colours: frac 0..255
-static void color_lerp_grb(uint8_t gA, uint8_t rA, uint8_t bA,
-                           uint8_t gB, uint8_t rB, uint8_t bB,
-                           uint8_t frac,
-                           uint8_t *gOut, uint8_t *rOut, uint8_t *bOut) {
-    uint16_t inv = 255 - frac;
-    *gOut = (uint8_t)(((uint16_t)gA * inv + (uint16_t)gB * frac) / 255);
-    *rOut = (uint8_t)(((uint16_t)rA * inv + (uint16_t)rB * frac) / 255);
-    *bOut = (uint8_t)(((uint16_t)bA * inv + (uint16_t)bB * frac) / 255);
-}
-
 /* ================================================================
- * SECTION 7 — Battery ADC (1S only)
+ * SECTION 8 — Battery ADC (1S only)
  * ================================================================ */
 
 static void batt_sample(void) {
@@ -264,11 +296,11 @@ static void batt_sample(void) {
 }
 
 /* ================================================================
- * SECTION 8 — Omitted (no tachometer)
+ * SECTION 9 — Omitted (no tachometer)
  * ================================================================ */
 
 /* ================================================================
- * SECTION 9 — Button gesture detection
+ * SECTION 10 — Button gesture detection
  * ================================================================ */
 
 // Forward declarations for state transitions
@@ -346,7 +378,7 @@ static void btn_poll(uint32_t now) {
 }
 
 /* ================================================================
- * SECTION 10 — Display update
+ * SECTION 11 — Display update
  * ================================================================ */
 
 static void dsp_update(uint32_t now) {
@@ -405,7 +437,7 @@ static void dsp_update(uint32_t now) {
 }
 
 /* ================================================================
- * SECTION 11 — State runners
+ * SECTION 12 — State runners
  * ================================================================ */
 
 static void enter_on(uint8_t dutyIdx) {
@@ -461,34 +493,35 @@ static void run_charging(uint32_t now) {
 }
 
 /* ================================================================
- * SECTION 12 — Deep sleep entry (STANDBY mode)
+ * SECTION 13 — Deep sleep entry (STANDBY mode)
  * ================================================================ */
 
 static void deep_sleep_enter(void) {
     // Turn everything off
     digitalWrite(FAN_EN_PIN, LOW);
     fan_pwm_write(0);
-    GPIOD->BSHR = (1 << (16 + 4));  // LED off
+    TIM1->CTLR1 &= ~(1 << 0);               // stop timer
+    NVIC_DisableIRQ(TIM1_UP_IRQn);          // disable timer interrupt
+    GPIOD->BSHR = (1 << (16 + 4));          // LED off
 
     // Configure EXTI wake sources: PD6 (EXTI6) + PC1 (EXTI1), falling edge
-    // Enable AFIO clock if not already
-    RCC->APB2PCENR |= (1 << 0);     // AFIO
+    RCC->APB2PCENR |= (1 << 0);             // AFIO
 
-    // PD6 → EXTI6: falling edge trigger
+    // PD6 → EXTI6: falling edge trigger (button press)
     EXTI->FTENR  |= (1 << 6);
     EXTI->INTENR |= (1 << 6);
-    EXTI->SWIEVR &= ~(1 << 6);      // clear pending
+    EXTI->SWIEVR &= ~(1 << 6);              // clear pending
 
     // PC1 → EXTI1: falling edge trigger (charger plug-in)
     EXTI->FTENR  |= (1 << 1);
     EXTI->INTENR |= (1 << 1);
-    EXTI->SWIEVR &= ~(1 << 1);      // clear pending
+    EXTI->SWIEVR &= ~(1 << 1);              // clear pending
 
     // Enter STANDBY: SLEEPDEEP=1, PDDS=1
     // PWR->CTLR: bit 2 = SLEEPDEEP, bit 1 = PDDS
-    RCC->APB1PCENR |= (1 << 28);     // PWR clock enable
-    PWR->CTLR |= (1 << 2);           // SLEEPDEEP
-    PWR->CTLR |= (1 << 1);           // PDDS = STANDBY (not STOP)
+    RCC->APB1PCENR |= (1 << 28);            // PWR clock enable
+    PWR->CTLR |= (1 << 2);                  // SLEEPDEEP
+    PWR->CTLR |= (1 << 1);                  // PDDS = STANDBY (not STOP)
 
     // Disable all interrupts to prevent spurious wake
     __asm__ volatile("csrw mie, %0" : : "r"(0));
@@ -497,12 +530,11 @@ static void deep_sleep_enter(void) {
     __asm__ volatile("wfi");
 
     // Should never reach here — STANDBY wake triggers POR reset
-    // But just in case, loop until reset occurs
     while (1) { /* wait for reset */ }
 }
 
 /* ================================================================
- * SECTION 13 — Arduino entry points
+ * SECTION 14 — Arduino entry points
  * ================================================================ */
 
 // CHARGE_PIN EXTI ISR — sets flag for instant charge detection
@@ -519,9 +551,8 @@ void setup(void) {
     pinMode(BATT_PIN,  INPUT);         // battery ADC
     pinMode(CHARGE_PIN, INPUT_PULLUP); // charge detect: active-low, pull-up
 
-    // Register-level peripherals
-    pinMode(FAN_PWM_PIN, OUTPUT);  // for analogWrite
-    ws2812_begin();
+    // TIM1: overflow ISR for WS2812 on PD4 + fan PWM on PC4
+    tim1_begin();
 
     // CHARGE_PIN EXTI for instant charge detection (falling edge = plug-in)
     attachInterrupt(CHARGE_PIN, GPIO_Mode_IPU, charge_isr,
