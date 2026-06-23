@@ -56,6 +56,7 @@ static const int dutyColors[4][3] = {
 #define BATT_MAX 4300
 #define BATT_MIN 3000
 #define CHARGE_PIN PC1 // active low
+#define CHG_DEBOUNCE_MS 50
 
 // ---- Intervals ----
 #define ADC_INTERVAL_MS 100
@@ -63,8 +64,8 @@ static const int dutyColors[4][3] = {
 #define OFF_TIMEOUT_MS 10000 // 10 s idle in S_WAIT(from S_ON) → deep sleep
 
 // ---- Breath effect periods ----
-#define WAKE_BREATH_PERIOD 1000   // 1 Hz
-#define CHARGE_BREATH_PERIOD 1000 // 1 Hz
+#define WAKE_BREATH_PERIOD 1000U   // 1 Hz
+#define CHARGE_BREATH_PERIOD 1000U // 1 Hz
 
 /* ================================================================
  * Global State
@@ -82,7 +83,8 @@ static State g_chgPrevState = S_WAIT; // state to restore after charger unplug
 
 // Battery
 static int g_batt_socPct = 0; // 0–100
-static long g_batt_tAdc = 0;
+static bool g_batt_valid = false;
+static unsigned long g_batt_tAdc = 0;
 
 // PWM
 static int g_dutyIdx = 0; // 0–3 = cycle (25/50/75/100)
@@ -99,6 +101,8 @@ static unsigned long g_tWait = 0;
 
 // Charge detection
 static volatile bool g_chargeFlag = false;
+static int g_chg_last_pin = 1;  // HIGH (pull-up, charger unplugged)
+static unsigned long g_chg_tStable = 0;
 
 /* ================================================================
  * Helpers
@@ -107,11 +111,9 @@ static volatile bool g_chargeFlag = false;
 static inline long irq_lock(void)
 {
     long mstatus;
-    __asm__ volatile("csrr %0, mstatus"
-                     : "=r"(mstatus));
-    __asm__ volatile("csrw mstatus, %0"
-                     :
-                     : "r"(mstatus & ~0x8));
+    __asm__ volatile("csrrc %0, mstatus, %1"
+                     : "=r"(mstatus)
+                     : "r"(0x8)); // atomically read mstatus, clear MIE (bit 3)
     return mstatus;
 }
 static inline void irq_restore(long prev)
@@ -160,7 +162,7 @@ static void deep_sleep_enter(void)
 }
 
 // Triangle wave: 0→255→0 over period_ms.  Returns current brightness 0–255.
-static int get_breath_brightness(long period_ms, unsigned long nowMillis)
+static int get_breath_brightness(unsigned long period_ms, unsigned long nowMillis)
 {
     long t = nowMillis % period_ms;
     long half = period_ms / 2;
@@ -198,6 +200,8 @@ static void batt_task(void)
 {
     int raw = analogRead(BATT_PIN);
 
+    g_batt_valid = true; // first ADC sample acquired — SoC data is now valid
+
     // 4-sample rolling average
     static int buf[4] = {0};
     static int idx = 0;
@@ -220,10 +224,6 @@ static void batt_task(void)
     else
     {
         g_batt_socPct = (int)((100UL * (vBatt - BATT_MIN)) / (BATT_MAX - BATT_MIN));
-        if (g_batt_socPct < 20)
-        {
-            // TODO: if in S_WAIT or S_ON, blink red to indicate low batt
-        }
     }
 }
 
@@ -239,7 +239,7 @@ static void btn_task(unsigned long nowMillis)
     static long tLast = 0;
     static int raw = HIGH, lastRaw = HIGH;
     static int deb = HIGH, lastDeb = HIGH;
-    static int dbCnt = 0;
+    static unsigned long tStable = 0;
     static long tPress = 0;
     static long tRelease = nowMillis;
     static int clicks = 0;
@@ -252,18 +252,13 @@ static void btn_task(unsigned long nowMillis)
 
     raw = digitalRead(BTN_PIN); // LOW = pressed
 
-    // Debounce
-    if (raw == lastRaw)
+    // Debounce: time-based, independent of loop rate
+    if (raw != lastRaw)
     {
-        if (dbCnt < BTN_DEBOUNCE_MS)
-            dbCnt++;
-    }
-    else
-    {
-        dbCnt = 0;
+        tStable = nowMillis;
     }
     lastRaw = raw;
-    if (dbCnt >= BTN_DEBOUNCE_MS)
+    if (nowMillis - tStable >= BTN_DEBOUNCE_MS)
         deb = raw;
 
     // Edge detection
@@ -315,7 +310,7 @@ static void btn_task(unsigned long nowMillis)
             else
             { // double: 100 %
                 g_dutyIdx = 3;
-                fan_pwm_write(100);
+                fan_pwm_write(dutyTable[3]);
             }
         }
         else if (g_state == S_WAIT)
@@ -348,6 +343,26 @@ static void led_task(unsigned long nowMillis)
         return;
     g_led_t_last_millis = nowMillis;
     g_led_dirty = false;
+
+    // Low-battery warning: 2 Hz red blink overrides normal display
+    if (g_batt_valid && g_batt_socPct < 20 && (g_state == S_WAIT || g_state == S_ON))
+    {
+        if ((nowMillis % 500) < 250)
+        {
+            // Red on (GRB order: G=0, R=255, B=0)
+            g_led_G = 0;
+            g_led_R = 255;
+            g_led_B = 0;
+        }
+        else
+        {
+            // Off
+            g_led_G = 0;
+            g_led_R = 0;
+            g_led_B = 0;
+        }
+        return;
+    }
 
     switch (g_state)
     {
@@ -447,6 +462,7 @@ static void state_run_charging(unsigned long nowMillis)
 static void charge_isr(void)
 {
     g_chargeFlag = true;
+    EXTI->INTFR = (1 << 1); // write 1 to clear any pending EXTI1
 }
 
 void setup(void)
@@ -484,21 +500,33 @@ void loop(void)
 {
     unsigned long nowMillis = millis();
 
-    // CHARGE_PIN: instant transition via EXTI flag, or poll fallback
-    if (g_chargeFlag || digitalRead(CHARGE_PIN) == LOW)
+    // Charge pin debounce
+    int chg_raw = digitalRead(CHARGE_PIN);
+    if (chg_raw != g_chg_last_pin)
+    {
+        g_chg_tStable = nowMillis;
+    }
+    g_chg_last_pin = chg_raw;
+    bool chg_low = (chg_raw == LOW) && (nowMillis - g_chg_tStable >= CHG_DEBOUNCE_MS);
+    bool chg_high = (chg_raw == HIGH) && (nowMillis - g_chg_tStable >= CHG_DEBOUNCE_MS);
+
+    // Clear EXTI flag unconditionally — its job is to wake the main loop
+    if (g_chargeFlag)
     {
         g_chargeFlag = false;
-        if (digitalRead(CHARGE_PIN) == LOW && g_state != S_CHARGING)
-        {
-            g_chgPrevState = g_state; // save state to restore on unplug
-            fan_off();
-            g_state = S_CHARGING;
-            g_led_dirty = true;
-        }
     }
 
-    // Charger unplugged → restore previous state
-    if (g_state == S_CHARGING && digitalRead(CHARGE_PIN) == HIGH)
+    // Charger plugged in (debounced)
+    if (chg_low && g_state != S_CHARGING)
+    {
+        g_chgPrevState = g_state; // save state to restore on unplug
+        fan_off();
+        g_state = S_CHARGING;
+        g_led_dirty = true;
+    }
+
+    // Charger unplugged (debounced)
+    if (g_state == S_CHARGING && chg_high)
     {
         g_state = g_chgPrevState;
         g_led_dirty = true;
