@@ -39,8 +39,8 @@ static const int dutyTable[4] = {25, 50, 75, 100};
 
 // Duty colours in GRB order: [G, R, B]
 static const int dutyColors[4][3] = {
-    {200, 0, 40},  // 25%  = CYAN
-    {200, 0, 0},   // 50%  = GREEN
+    {220, 0, 40},  // 25%  = CYAN
+    {220, 0, 0},   // 50%  = GREEN
     {127, 127, 0}, // 75%  = YELLOW
     {40, 255, 0},  // 100% = ORANGE
 };
@@ -59,6 +59,8 @@ static const int dutyColors[4][3] = {
 #define ADC_REF 2800
 #define BATT_PIN PA2
 #define BATT_MAX 4300
+#define BATT_FULL 4180
+#define BATT_LOW 3100
 #define BATT_MIN 3000
 #define CHARGE_PIN PC1 // active low
 #define CHG_DEBOUNCE_MS 50
@@ -66,7 +68,7 @@ static const int dutyColors[4][3] = {
 // ---- Intervals ----
 #define ADC_INTERVAL_MS 100
 #define LED_INTERVAL_MS 10
-#define OFF_TIMEOUT_MS 5000 // 5s idle in S_WAIT(from S_ON) → deep sleep
+#define OFF_TIMEOUT_MS 5000 // 5s idle in S_WAIT → deep sleep
 
 // ---- Breath effect periods ----
 #define WAKE_BREATH_PERIOD 1000U   // 1 Hz
@@ -83,7 +85,6 @@ enum State : int
     S_CHARGING = 2,
 };
 static State g_state = S_WAIT;
-static State g_prevState = S_WAIT;    // in S_WAIT: if==S_ON → 10s auto-sleep timer active
 static State g_chgPrevState = S_WAIT; // state to restore after charger unplug
 
 // Battery
@@ -104,7 +105,7 @@ static long g_led_t_last_millis = 0;
 // DMA buffer for WS2812 PWM+DMA (one half-word per bit + reset)
 static uint16_t g_ws2812_dma_buf[WS2812_BUF_SIZE];
 
-// S_WAIT timer (10 s countdown when g_prevState == S_ON)
+// S_WAIT auto-sleep timer — resets on any S_WAIT entry or button activity
 static unsigned long g_tWait = 0;
 
 // Charge detection
@@ -312,18 +313,18 @@ static void batt_task(void)
     // vBatt_mV = adc * Vref * 2 / 1024  (Vref = 2800 mV internal, divider ratio = 0.5)
     long vBatt = ((long)adcAvg * (long)ADC_REF * 2UL) / 1024UL;
 
-    // SoC: linear 0–100 % between BATT_MIN and BATT_MAX
-    if (vBatt <= BATT_MIN)
+    // SoC: linear 0–100 % between BATT_LOW and BATT_FULL
+    if (vBatt <= BATT_LOW)
     {
         g_batt_socPct = 0;
     }
-    else if (vBatt >= BATT_MAX)
+    else if (vBatt >= BATT_FULL)
     {
         g_batt_socPct = 100;
     }
     else
     {
-        g_batt_socPct = (int)((100UL * (vBatt - BATT_MIN)) / (BATT_MAX - BATT_MIN));
+        g_batt_socPct = (int)((100UL * (vBatt - BATT_LOW)) / (BATT_FULL - BATT_LOW));
     }
 }
 
@@ -385,7 +386,6 @@ static void btn_task(unsigned long nowMillis)
         if (g_state == S_ON)
         {
             fan_off();
-            g_prevState = S_ON; // signals: 10 s auto-sleep timer is active
             g_tWait = nowMillis;
             g_state = S_WAIT;
         }
@@ -415,7 +415,7 @@ static void btn_task(unsigned long nowMillis)
         }
         else if (g_state == S_WAIT)
         {
-            // Any click cancels the 10 s auto-sleep timer (implicit by leaving S_WAIT)
+            // Any click leaves S_WAIT → S_ON (auto-sleep timer stops implicitly)
             if (clicks == 1)
             { // single: ON at 25 %
                 g_dutyIdx = 0;
@@ -445,7 +445,7 @@ static void led_task(unsigned long nowMillis)
     g_led_dirty = false;
 
     // Low-battery warning: 2 Hz red blink overrides normal display
-    if (g_batt_valid && g_batt_socPct < 20 && (g_state == S_WAIT || g_state == S_ON))
+    if (g_batt_valid && g_batt_socPct < 10 && (g_state == S_WAIT || g_state == S_ON))
     {
         if ((nowMillis % 500) < 250)
         {
@@ -491,7 +491,7 @@ static void led_task(unsigned long nowMillis)
             {
                 // Fully charged: solid green
                 g_led_R = 0;
-                g_led_G = 255;
+                g_led_G = 220;
                 g_led_B = 0;
             }
             else
@@ -519,8 +519,8 @@ static void state_run_wait(unsigned long nowMillis)
 {
     btn_task(nowMillis);
 
-    // 10 s auto-sleep timer (only when coming from S_ON)
-    if (g_prevState == S_ON && (nowMillis - g_tWait >= OFF_TIMEOUT_MS))
+    // 5s auto-sleep timer
+    if (nowMillis - g_tWait >= OFF_TIMEOUT_MS)
     {
         deep_sleep_enter();
         return;
@@ -597,7 +597,7 @@ void setup(void)
     ws2812_begin();
 
     // Initial state: check if charger is plugged in at boot
-    g_prevState = S_WAIT; // signals: no auto-sleep timer
+    g_tWait = millis(); // start S_WAIT auto-sleep timer
     g_batt_tAdc = 0;
 
     // If we woke from standby AND the charger is not plugged in, it was a
@@ -658,7 +658,7 @@ void loop(void)
             digitalWrite(FAN_EN_PIN, HIGH);
             fan_pwm_write(dutyTable[g_dutyIdx]);
         }
-        // If previous was S_WAIT, g_prevState is preserved (10s timer state intact)
+        if (g_state == S_WAIT) g_tWait = nowMillis; // restart auto-sleep timer
     }
 
     switch (g_state)
