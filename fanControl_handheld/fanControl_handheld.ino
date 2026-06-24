@@ -10,12 +10,12 @@
  *
  * UX:
  *       - Power on(POR) or exit deep sleep: pure blue, breath brightness, 1 Hz
- *       - click       → ON (FAN_EN high, duty 25%), solid CYAN
+ *       - click       → ON (FAN_EN high, duty 35%), solid CYAN
  *       - double-click → ON at 100% (quick shortcut)
- *       - ON state:  click cycles 25%→50%→75%→100%→25%
+ *       - ON state:  click cycles 35% → 50% → 65% → 80% → 90% → 100% → 35%
  *                    double-click → 100%
- *                    long-press → back to blue breath(fan OFF)
- *       - 25%=CYAN, 50%=GREEN, 75%=YELLOW, 100%=ORANGE
+ *                    long-press → back to blue breath (fan OFF)
+ *       - linear map blue->green->orange for pwm duty
  *       - charging: ignore button, force fan OFF, breath battery SoC colour at 1 Hz
  *         (red=low → green=full), solid green when fully charged
  */
@@ -27,8 +27,16 @@
 // ---- Fan PWM (TIM1_CH4 on PC4) ----
 #define FAN_EN_PIN PC2  // active high MOSFET gate
 #define FAN_PWM_PIN PC4 // TIM1_CH4
+
+#define FAN_LVL_1 35
+#define FAN_LVL_2 50
+#define FAN_LVL_3 65
+#define FAN_LVL_4 80
+#define FAN_LVL_5 90
+#define FAN_LVL_6 100
+#define FAN_LVL_COUNT 6
 // Duty table (single-click cycle)
-static const int dutyTable[4] = {25, 50, 75, 100};
+static const int dutyTable[FAN_LVL_COUNT] = {FAN_LVL_1, FAN_LVL_2, FAN_LVL_3, FAN_LVL_4, FAN_LVL_5, FAN_LVL_6};
 
 // ---- WS2812 via TIM2_CH4 PWM+DMA on PD5 (T2CH4_3) ----
 #define NUM_LEDS 1
@@ -36,14 +44,6 @@ static const int dutyTable[4] = {25, 50, 75, 100};
 #define WS2812_T1H 38                                      // ~0.8 µs at 800 kHz
 #define WS2812_RESET_LEN 50                                // >50 µs reset = 62.5 µs
 #define WS2812_BUF_SIZE (NUM_LEDS * 24 + WS2812_RESET_LEN) // 74
-
-// Duty colours in GRB order: [G, R, B]
-static const int dutyColors[4][3] = {
-    {220, 0, 40},  // 25%  = CYAN
-    {220, 0, 0},   // 50%  = GREEN
-    {127, 127, 0}, // 75%  = YELLOW
-    {40, 255, 0},  // 100% = ORANGE
-};
 
 // ---- Button ----
 #define BTN_PIN PD6 // active low
@@ -93,7 +93,7 @@ static bool g_batt_valid = false;
 static unsigned long g_batt_tAdc = 0;
 
 // PWM
-static int g_dutyIdx = 0; // 0–3 = cycle (25/50/75/100)
+static int g_dutyIdx = 0; // 0–FAN_LVL_COUNT
 
 // WS2812 LED colour (GRB order)
 static int g_led_G = 0;
@@ -125,6 +125,7 @@ static inline long irq_lock(void)
                      : "r"(0x8)); // atomically read mstatus, clear MIE (bit 3)
     return mstatus;
 }
+
 static inline void irq_restore(long prev)
 {
     __asm__ volatile("csrw mstatus, %0"
@@ -290,7 +291,8 @@ static void fan_pwm_write(int pct)
 
 static void fan_off(void)
 {
-    digitalWrite(FAN_PWM_PIN, LOW);
+    fan_pwm_write(0);
+    delay(5);
     digitalWrite(FAN_EN_PIN, LOW);
 }
 
@@ -404,27 +406,27 @@ static void btn_task(unsigned long nowMillis)
         {
             if (clicks == 1)
             { // single: cycle duty
-                g_dutyIdx = (g_dutyIdx + 1) % 4;
+                g_dutyIdx = (g_dutyIdx + 1) % FAN_LVL_COUNT;
                 fan_pwm_write(dutyTable[g_dutyIdx]);
             }
             else
             { // double: 100 %
-                g_dutyIdx = 3;
-                fan_pwm_write(dutyTable[3]);
+                g_dutyIdx = FAN_LVL_COUNT-1;
+                fan_pwm_write(dutyTable[FAN_LVL_COUNT-1]);
             }
         }
         else if (g_state == S_WAIT)
         {
             // Any click leaves S_WAIT → S_ON (auto-sleep timer stops implicitly)
             if (clicks == 1)
-            { // single: ON at 25 %
+            { // single: ON at FAN_LVL_1%
                 g_dutyIdx = 0;
                 fan_pwm_write(dutyTable[0]);
             }
             else
             { // double: ON at 100 % (quick shortcut)
-                g_dutyIdx = 3;
-                fan_pwm_write(dutyTable[3]);
+                g_dutyIdx = FAN_LVL_COUNT-1;
+                fan_pwm_write(dutyTable[FAN_LVL_COUNT-1]);
             }
             digitalWrite(FAN_EN_PIN, HIGH);
             g_state = S_ON;
@@ -478,6 +480,15 @@ static void led_task(unsigned long nowMillis)
 
         case S_ON:
         {
+            // Duty colours in GRB order: [G, R, B]
+            static const int dutyColors[FAN_LVL_COUNT][3] = {
+                {220, 0, 40},  // 35%  = CYAN
+                {220, 0, 0},   // 50%  = GREEN
+                {180, 40, 0},  // 65%  = CHARTREUSE
+                {127, 127, 0}, // 80%  = YELLOW
+                {50, 200, 0},  // 90%  = ORANGE
+                {20, 255, 0},  // 100% = near RED
+            };
             // Solid duty colour
             g_led_G = dutyColors[g_dutyIdx][0];
             g_led_R = dutyColors[g_dutyIdx][1];
