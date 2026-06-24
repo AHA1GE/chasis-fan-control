@@ -66,11 +66,11 @@ static const int dutyColors[4][3] = {
 // ---- Intervals ----
 #define ADC_INTERVAL_MS 100
 #define LED_INTERVAL_MS 10
-#define OFF_TIMEOUT_MS 10000 // 10 s idle in S_WAIT(from S_ON) → deep sleep
+#define OFF_TIMEOUT_MS 5000 // 5s idle in S_WAIT(from S_ON) → deep sleep
 
 // ---- Breath effect periods ----
 #define WAKE_BREATH_PERIOD 1000U   // 1 Hz
-#define CHARGE_BREATH_PERIOD 2000U // 1 Hz
+#define CHARGE_BREATH_PERIOD 2000U // 0.5 Hz
 
 /* ================================================================
  * Global State
@@ -218,16 +218,21 @@ static void deep_sleep_enter(void)
     // Configure EXTI wake sources: PD6 (EXTI6) + PC1 (EXTI1), falling edge
     RCC->APB2PCENR |= (1 << 0); // AFIO
 
+    // Route PD6 → EXTI6 via AFIO->EXTICR.
+    // EXTICR reset default is 0x0000 (all lines → PORTA), so EXTI6 would
+    // listen on PA6 unless we explicitly select GPIOD (0b11 in bits 13:12).
+    AFIO->EXTICR = (AFIO->EXTICR & ~(3UL << 12)) | (3UL << 12); // PD6→EXTI6
+
     // PD6 → EXTI6: falling edge trigger (button press)
-    // EXTI lines 4-7 on CH32V003 are fixed-port — EXTI6 fires on
-    // PD6 (pin 6 of GPIOD).  No AFIO->EXTICR configuration needed.
     EXTI->FTENR |= (1 << 6);
     EXTI->INTENR |= (1 << 6);
     EXTI->INTFR = (1 << 6); // write 1 to clear any pending EXTI6
 
+    // Route PC1 → EXTI1 (0b10 = GPIOC in bits 3:2).
+    // Re-applied here because standby can reset AFIO registers.
+    AFIO->EXTICR = (AFIO->EXTICR & ~(3UL << 2)) | (2UL << 2);  // PC1→EXTI1
+
     // PC1 → EXTI1: falling edge trigger (charger plug-in)
-    // EXTI1 routing to PC1 was already set up by attachInterrupt() in setup(),
-    // but re-apply here in case standby-gate reset clears it.
     EXTI->FTENR |= (1 << 1);
     EXTI->INTENR |= (1 << 1);
     EXTI->INTFR = (1 << 1); // write 1 to clear any pending EXTI1
