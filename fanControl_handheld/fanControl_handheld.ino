@@ -31,18 +31,18 @@
 static const int dutyTable[4] = {25, 50, 75, 100};
 
 // ---- WS2812 via TIM2_CH4 PWM+DMA on PD5 (T2CH4_3) ----
-#define NUM_LEDS          1
-#define WS2812_T0H        19     // ~0.4 µs at 800 kHz
-#define WS2812_T1H        38     // ~0.8 µs at 800 kHz
-#define WS2812_RESET_LEN  50     // >50 µs reset = 62.5 µs
-#define WS2812_BUF_SIZE   (NUM_LEDS * 24 + WS2812_RESET_LEN)  // 74
+#define NUM_LEDS 1
+#define WS2812_T0H 19                                      // ~0.4 µs at 800 kHz
+#define WS2812_T1H 38                                      // ~0.8 µs at 800 kHz
+#define WS2812_RESET_LEN 50                                // >50 µs reset = 62.5 µs
+#define WS2812_BUF_SIZE (NUM_LEDS * 24 + WS2812_RESET_LEN) // 74
 
 // Duty colours in GRB order: [G, R, B]
 static const int dutyColors[4][3] = {
-    {128, 0, 128}, // 25%  = CYAN
-    {255, 0, 0},   // 50%  = GREEN
-    {128, 128, 0}, // 75%  = YELLOW
-    {100, 154, 0}, // 100% = ORANGE
+    {200, 0, 40},  // 25%  = CYAN
+    {200, 0, 0},   // 50%  = GREEN
+    {127, 127, 0}, // 75%  = YELLOW
+    {40, 255, 0},  // 100% = ORANGE
 };
 
 // ---- Button ----
@@ -70,7 +70,7 @@ static const int dutyColors[4][3] = {
 
 // ---- Breath effect periods ----
 #define WAKE_BREATH_PERIOD 1000U   // 1 Hz
-#define CHARGE_BREATH_PERIOD 1000U // 1 Hz
+#define CHARGE_BREATH_PERIOD 2000U // 1 Hz
 
 /* ================================================================
  * Global State
@@ -109,7 +109,7 @@ static unsigned long g_tWait = 0;
 
 // Charge detection
 static volatile bool g_chargeFlag = false;
-static int g_chg_last_pin = 1;  // HIGH (pull-up, charger unplugged)
+static int g_chg_last_pin = 1; // HIGH (pull-up, charger unplugged)
 static unsigned long g_chg_tStable = 0;
 
 /* ================================================================
@@ -131,10 +131,89 @@ static inline void irq_restore(long prev)
                      : "r"(prev));
 }
 
+// WS2812 PWM+DMA driver (TIM2_CH4 on PD5, 800 kHz carrier)
+static void ws2812_begin(void)
+{
+    // ---- Clocks ----
+    RCC->APB2PCENR |= (1 << 5)    // GPIOD
+                      | (1 << 0); // AFIO
+    RCC->APB1PCENR |= (1 << 0);   // TIM2
+    RCC->AHBPCENR |= (1 << 0);    // DMA1
+
+    // ---- AFIO: TIM2 Full Remap (TIM2_RM[1:0] = 11 → CH4 on PD5) ----
+    AFIO->PCFR1 = (AFIO->PCFR1 & ~(3UL << 8)) | (3UL << 8);
+
+    // ---- PD5 → alternate push-pull, 50 MHz (nibble 5, bits 23:20) ----
+    GPIOD->CFGLR = (GPIOD->CFGLR & ~(0xFUL << 20)) | (0xBUL << 20);
+
+    // ---- TIM2: PSC=0, ARR=59 → 48 MHz / 60 = 800 kHz ----
+    TIM2->PSC = 0;
+    TIM2->ATRLR = 59;
+    TIM2->CNT = 0;
+
+    // ---- CH4: PWM mode 1, no preload (OC4PE=0) for direct DMA updates ----
+    // Preload off avoids the "first DMA value used for 3 periods" issue.
+    // CHCTLR2 bits 15:12 control CH4: OC4M[2:0]=110(PWM1), OC4PE=0
+    TIM2->CHCTLR2 = (6UL << 12);
+
+    // ---- CH4 output enable (CC4E) ----
+    TIM2->CCER |= (1UL << 12);
+
+    // ---- DMA request on update (UDE) ----
+    TIM2->DMAINTENR |= TIM_UDE;
+
+    // ---- DMA1 Channel 2: TIM2_UP → Memory→TIM2_CH4CVR, 16-bit, normal mode ----
+    // CH32V003 RM Table 8-2: TIM2_UP request is hardwired to DMA1 Channel 2.
+    // (Channel 5, which was used previously, only serves TIM1_CH3/CH4/USART1_TX.)
+    DMA1_Channel2->PADDR = (uint32_t)&TIM2->CH4CVR;
+    DMA1_Channel2->MADDR = (uint32_t)g_ws2812_dma_buf;
+    // CFGR: DIR=M2P(bit4), MINC(bit7), PSIZE=16b(bit8), MSIZE=16b(bit10), PL=High(bits13:12=10)
+    DMA1_Channel2->CFGR = (1UL << 4) | (1UL << 7) | (1UL << 8) | (1UL << 10) | (2UL << 12);
+}
+// WS2812 PWM+DMA driver (TIM2_CH4 on PD5, 800 kHz carrier)
+static void ws2812_send(uint8_t g, uint8_t r, uint8_t b)
+{
+    // Fill DMA buffer: 24 bits GRB MSB-first + 50 reset slots
+    uint32_t packed = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
+    uint16_t pos = 0;
+    for (uint8_t i = 0; i < 24; i++)
+    {
+        g_ws2812_dma_buf[pos++] = (packed & 0x800000UL) ? WS2812_T1H : WS2812_T0H;
+        packed <<= 1;
+    }
+    for (uint8_t i = 0; i < WS2812_RESET_LEN; i++)
+    {
+        g_ws2812_dma_buf[pos++] = 0;
+    }
+
+    // Preload the first buffer value into CH4CVR so the first PWM period
+    // uses the correct duty (with OC4PE=0 this writes directly to the active
+    // compare register — no preload shadow to worry about).
+    TIM2->CH4CVR = g_ws2812_dma_buf[0];
+
+    // Re-arm DMA (Channel 2 — TIM2_UP request destination)
+    DMA1_Channel2->CFGR &= ~(1UL << 0);                // CHEN = 0
+    DMA1_Channel2->CNTR = WS2812_BUF_SIZE;             // transfer count
+    DMA1_Channel2->MADDR = (uint32_t)g_ws2812_dma_buf; // reset memory ptr
+    DMA1_Channel2->CFGR |= (1UL << 0);                 // CHEN = 1
+
+    // Start timer (was stopped after previous transmission)
+    TIM2->CTLR1 |= (1UL << 0); // CEN
+
+    // Poll transfer-complete (TC2 = INTFR bit 5 for Channel 2)
+    while (!(DMA1->INTFR & (1UL << 5)))
+        ;
+    DMA1->INTFCR = (1UL << 5); // clear TC2
+
+    // Stop timer
+    TIM2->CTLR1 &= ~(1UL << 0); // CEN = 0
+}
+
 static void deep_sleep_enter(void)
 {
     // Turn everything off
     fan_off();
+    ws2812_send(0, 0, 0);
 
     // Configure EXTI wake sources: PD6 (EXTI6) + PC1 (EXTI1), falling edge
     RCC->APB2PCENR |= (1 << 0); // AFIO
@@ -156,13 +235,13 @@ static void deep_sleep_enter(void)
     // Enter STANDBY: SLEEPDEEP=1 (in PFIC SCTLR), PDDS=1 (in PWR->CTLR)
     RCC->APB1PCENR |= (1 << 28); // PWR clock enable
 
-    PWR->CTLR &= ~(1UL << 0);    // Clear LPDS  — ensure correct standby mode
-    PWR->CTLR |= (1UL << 1);     // Set   PDDS  — Power-Down Deepsleep = Standby
+    PWR->CTLR &= ~(1UL << 0); // Clear LPDS  — ensure correct standby mode
+    PWR->CTLR |= (1UL << 1);  // Set   PDDS  — Power-Down Deepsleep = Standby
 
     // CRITICAL: SLEEPDEEP is in the PFIC System Control Register (NVIC->SCTLR
     // bit 2), NOT in PWR->CTLR.  The original code wrote to PWR->CTLR bit 2
     // which is CWUF (Clear Wakeup Flag) — a no-op for standby entry.
-    NVIC->SCTLR |= (1 << 2);     // SLEEPDEEP = 1
+    NVIC->SCTLR |= (1 << 2); // SLEEPDEEP = 1
 
     // Execute WFI to enter standby.
     // Do NOT disable interrupts (csrw mie,0) — in Standby mode the EXTI
@@ -192,8 +271,8 @@ static int get_breath_brightness(unsigned long period_ms, unsigned long nowMilli
 static void soc_to_color(int socPct, int *g, int *r, int *b)
 {
     int pct = (socPct > 100) ? 100 : socPct;
-    *r = (int)(255 - ((int)pct * 255 / 100));
-    *g = (int)((int)pct * 255 / 100);
+    *r = (int)((100 - pct) * 25 / 10);
+    *g = (int)(pct * 15 / 10);
     *b = 0;
 }
 
@@ -207,84 +286,6 @@ static void fan_off(void)
 {
     digitalWrite(FAN_PWM_PIN, LOW);
     digitalWrite(FAN_EN_PIN, LOW);
-}
-
-/* ================================================================
- * WS2812 PWM+DMA driver (TIM2_CH4 on PD5, 800 kHz carrier)
- * ================================================================ */
-
-static void ws2812_begin(void)
-{
-    // ---- Clocks ----
-    RCC->APB2PCENR |= (1 << 5)   // GPIOD
-                   |  (1 << 0);  // AFIO
-    RCC->APB1PCENR |= (1 << 0);  // TIM2
-    RCC->AHBPCENR  |= (1 << 0);  // DMA1
-
-    // ---- AFIO: TIM2 Full Remap (TIM2_RM[1:0] = 11 → CH4 on PD5) ----
-    AFIO->PCFR1 = (AFIO->PCFR1 & ~(3UL << 8)) | (3UL << 8);
-
-    // ---- PD5 → alternate push-pull, 50 MHz (nibble 5, bits 23:20) ----
-    GPIOD->CFGLR = (GPIOD->CFGLR & ~(0xFUL << 20)) | (0xBUL << 20);
-
-    // ---- TIM2: PSC=0, ARR=59 → 48 MHz / 60 = 800 kHz ----
-    TIM2->PSC   = 0;
-    TIM2->ATRLR = 59;
-    TIM2->CNT   = 0;
-
-    // ---- CH4: PWM mode 1, no preload (OC4PE=0) for direct DMA updates ----
-    // Preload off avoids the "first DMA value used for 3 periods" issue.
-    // CHCTLR2 bits 15:12 control CH4: OC4M[2:0]=110(PWM1), OC4PE=0
-    TIM2->CHCTLR2 = (6UL << 12);
-
-    // ---- CH4 output enable (CC4E) ----
-    TIM2->CCER |= (1UL << 12);
-
-    // ---- DMA request on update (UDE) ----
-    TIM2->DMAINTENR |= TIM_UDE;
-
-    // ---- DMA1 Channel 2: TIM2_UP → Memory→TIM2_CH4CVR, 16-bit, normal mode ----
-    // CH32V003 RM Table 8-2: TIM2_UP request is hardwired to DMA1 Channel 2.
-    // (Channel 5, which was used previously, only serves TIM1_CH3/CH4/USART1_TX.)
-    DMA1_Channel2->PADDR = (uint32_t)&TIM2->CH4CVR;
-    DMA1_Channel2->MADDR = (uint32_t)g_ws2812_dma_buf;
-    // CFGR: DIR=M2P(bit4), MINC(bit7), PSIZE=16b(bit8), MSIZE=16b(bit10), PL=High(bits13:12=10)
-    DMA1_Channel2->CFGR  = (1UL << 4) | (1UL << 7) | (1UL << 8) | (1UL << 10) | (2UL << 12);
-}
-
-static void ws2812_send(uint8_t g, uint8_t r, uint8_t b)
-{
-    // Fill DMA buffer: 24 bits GRB MSB-first + 50 reset slots
-    uint32_t packed = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
-    uint16_t pos = 0;
-    for (uint8_t i = 0; i < 24; i++) {
-        g_ws2812_dma_buf[pos++] = (packed & 0x800000UL) ? WS2812_T1H : WS2812_T0H;
-        packed <<= 1;
-    }
-    for (uint8_t i = 0; i < WS2812_RESET_LEN; i++) {
-        g_ws2812_dma_buf[pos++] = 0;
-    }
-
-    // Preload the first buffer value into CH4CVR so the first PWM period
-    // uses the correct duty (with OC4PE=0 this writes directly to the active
-    // compare register — no preload shadow to worry about).
-    TIM2->CH4CVR = g_ws2812_dma_buf[0];
-
-    // Re-arm DMA (Channel 2 — TIM2_UP request destination)
-    DMA1_Channel2->CFGR &= ~(1UL << 0);          // CHEN = 0
-    DMA1_Channel2->CNTR  = WS2812_BUF_SIZE;      // transfer count
-    DMA1_Channel2->MADDR = (uint32_t)g_ws2812_dma_buf;  // reset memory ptr
-    DMA1_Channel2->CFGR |= (1UL << 0);           // CHEN = 1
-
-    // Start timer (was stopped after previous transmission)
-    TIM2->CTLR1 |= (1UL << 0);                   // CEN
-
-    // Poll transfer-complete (TC2 = INTFR bit 5 for Channel 2)
-    while (!(DMA1->INTFR & (1UL << 5)));
-    DMA1->INTFCR = (1UL << 5);                   // clear TC2
-
-    // Stop timer
-    TIM2->CTLR1 &= ~(1UL << 0);                  // CEN = 0
 }
 
 /* ================================================================
@@ -456,50 +457,51 @@ static void led_task(unsigned long nowMillis)
             g_led_B = 0;
         }
     }
-    else switch (g_state)
-    {
-
-    case S_WAIT:
-    {
-        // Blue breath 1 Hz (always, regardless of how we entered)
-        int bright = get_breath_brightness(WAKE_BREATH_PERIOD, nowMillis);
-        g_led_G = 0;
-        g_led_R = 0;
-        g_led_B = bright;
-        break;
-    }
-
-    case S_ON:
-    {
-        // Solid duty colour
-        g_led_G = dutyColors[g_dutyIdx][0];
-        g_led_R = dutyColors[g_dutyIdx][1];
-        g_led_B = dutyColors[g_dutyIdx][2];
-        break;
-    }
-
-    case S_CHARGING:
-    {
-        if (g_batt_socPct >= 100)
+    else
+        switch (g_state)
         {
-            // Fully charged: solid green
+
+        case S_WAIT:
+        {
+            // Blue breath 1 Hz (always, regardless of how we entered)
+            int bright = get_breath_brightness(WAKE_BREATH_PERIOD, nowMillis);
+            g_led_G = 0;
             g_led_R = 0;
-            g_led_G = 255;
-            g_led_B = 0;
+            g_led_B = bright;
+            break;
         }
-        else
+
+        case S_ON:
         {
-            // Breathing battery SoC colour at 1 Hz
-            int bright = get_breath_brightness(CHARGE_BREATH_PERIOD, nowMillis);
-            int r, g, b;
-            soc_to_color(g_batt_socPct, &g, &r, &b);
-            g_led_R = (r * bright / 255);
-            g_led_G = (g * bright / 255);
-            g_led_B = (b * bright / 255);
+            // Solid duty colour
+            g_led_G = dutyColors[g_dutyIdx][0];
+            g_led_R = dutyColors[g_dutyIdx][1];
+            g_led_B = dutyColors[g_dutyIdx][2];
+            break;
         }
-        break;
-    }
-    }
+
+        case S_CHARGING:
+        {
+            if (g_batt_socPct >= 100)
+            {
+                // Fully charged: solid green
+                g_led_R = 0;
+                g_led_G = 255;
+                g_led_B = 0;
+            }
+            else
+            {
+                // Breathing battery SoC colour at 1 Hz
+                int bright = get_breath_brightness(CHARGE_BREATH_PERIOD, nowMillis);
+                int r, g, b;
+                soc_to_color(g_batt_socPct, &g, &r, &b);
+                g_led_R = (r * bright / 255);
+                g_led_G = (g * bright / 255);
+                g_led_B = (b * bright / 255);
+            }
+            break;
+        }
+        }
 
     // Push to WS2812 via PWM+DMA
     ws2812_send((uint8_t)g_led_G, (uint8_t)g_led_R, (uint8_t)g_led_B);
