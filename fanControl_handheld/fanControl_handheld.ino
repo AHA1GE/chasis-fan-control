@@ -469,10 +469,10 @@ static void led_task(unsigned long nowMillis) {
         {
           // Duty colours in GRB order: [G, R, B]
           static const int dutyColors[FAN_LVL_COUNT][3] = {
-            { 220, 0, 40 },   // 35%  = CYAN
+            { 220, 0, 50 },   // 35%  = CYAN
             { 220, 0, 0 },    // 50%  = GREEN
-            { 180, 40, 0 },   // 65%  = CHARTREUSE
-            { 127, 127, 0 },  // 80%  = YELLOW
+            { 180, 80, 0 },   // 65%  = CHARTREUSE
+            { 120, 120, 0 },  // 80%  = YELLOW
             { 50, 200, 0 },   // 90%  = ORANGE
             { 20, 255, 0 },   // 100% = near RED
           };
